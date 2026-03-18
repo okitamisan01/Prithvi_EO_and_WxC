@@ -4,3 +4,6 @@ Prithvi-WxC/
 mizuho_output/
 data/hls_counties/*
 data/mizuho_output/*
+data/climatology/*
+data/merra-2/*
+data/row/*
