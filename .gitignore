@@ -7,3 +7,5 @@ data/mizuho_output/*
 data/climatology/*
 data/merra-2/*
 data/row/*
+*.pt
+.cache/
