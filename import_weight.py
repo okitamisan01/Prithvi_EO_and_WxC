@@ -2,8 +2,8 @@ from huggingface_hub import hf_hub_download, snapshot_download
 from pathlib import Path
 
 # Create output directories
-eo_dir = Path("data/Prithvi-EO")
-wxc_dir = Path("data/Prithvi-WxC")
+eo_dir = Path("data/Prithvi-EO-data")
+wxc_dir = Path("data/Prithvi-WxC-data")
 
 eo_dir.mkdir(parents=True, exist_ok=True)
 wxc_dir.mkdir(parents=True, exist_ok=True)

@@ -1,11 +1,14 @@
 .venv/
 Prithvi-EO-2.0-300M/
 Prithvi-WxC/
-mizuho_output/
+mizuho_output/*
 data/hls_counties/*
 data/mizuho_output/*
 data/climatology/*
 data/merra-2/*
-data/row/*
+data/raw/*
 *.pt
-.cache/
+.cache/*
+*.zip
+*.tar.gz
+*.tif
