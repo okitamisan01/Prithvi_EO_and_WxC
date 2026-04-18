@@ -23,6 +23,7 @@ import torch.nn.functional as F
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
+import random
 
 # ════════════════════════════════════════════════════════
 #  SETTINGS — edit these to match your environment
@@ -35,6 +36,8 @@ CSV_PATH   = DATA_DIR / "USDA_Soybean_County_2020.csv"
 N_EPOCHS   = 500       # was 100 — model hadn't converged yet
 LR         = 1e-4
 L2_LAMBDA  = 1e-5
+TRAIN_RATIO = 0.7
+RANDOM_SEED = 42
 
 # ════════════════════════════════════════════════════════
 #  MODEL DEFINITIONS (copied from Cell 5 & 6)
@@ -158,6 +161,50 @@ print(f"  eo_q_train          : {eo_q_train.shape}")
 print(f"  met_emb_train       : {met_emb_train.shape}")
 
 # ════════════════════════════════════════════════════════
+#  SPLIT TRAIN/TEST
+# ════════════════════════════════════════════════════════
+
+random.seed(RANDOM_SEED)
+shuffled = valid_geoids.copy()
+random.shuffle(shuffled)
+ 
+n_train = int(len(shuffled) * TRAIN_RATIO)
+train_geoids = shuffled[:n_train]   # 70%
+test_geoids  = shuffled[n_train:]   # 30%
+ 
+train_indices = [RESOLVED_GEOIDS.index(g) for g in train_geoids]
+test_indices  = [RESOLVED_GEOIDS.index(g) for g in test_geoids]
+ 
+print(f"\n  Train/Test split (seed={RANDOM_SEED})")
+print(f"  Train : {len(train_geoids)} counties ({len(train_geoids)/len(valid_geoids)*100:.0f}%)")
+print(f"  Test  : {len(test_geoids)}  counties ({len(test_geoids)/len(valid_geoids)*100:.0f}%)")
+print(f"  Test counties : {test_geoids}")
+ 
+
+# ════════════════════════════════════════════════════════
+#  NORMALIZE
+# ════════════════════════════════════════════════════════
+
+train_yield_values = [yield_map[g] for g in train_geoids]
+y_mean = sum(train_yield_values) / len(train_yield_values)
+y_std  = (sum((v - y_mean) ** 2 for v in train_yield_values) / len(train_yield_values)) ** 0.5
+ 
+def normalize(geoids):
+    return [(yield_map[g] - y_mean) / y_std for g in geoids]
+ 
+y_train = torch.tensor(normalize(train_geoids), dtype=torch.float32).unsqueeze(0).to(device)
+y_test  = torch.tensor(normalize(test_geoids),  dtype=torch.float32).unsqueeze(0).to(device)
+ 
+print(f"\n  y_mean={y_mean:.2f} bu/acre  y_std={y_std:.2f} bu/acre  (train統計量)")
+ 
+eo_q_train    = eo_q[:, train_indices, :].detach()
+met_emb_train = met_emb[:, train_indices, :].detach()
+eo_q_test     = eo_q[:, test_indices,  :].detach()
+met_emb_test  = met_emb[:, test_indices,  :].detach()
+ 
+print(f"  eo_q_train : {eo_q_train.shape}  |  eo_q_test : {eo_q_test.shape}")
+
+# ════════════════════════════════════════════════════════
 #  SANITY CHECK — shape / dtype / device
 # ════════════════════════════════════════════════════════
 
@@ -174,19 +221,13 @@ norm_clim  = nn.LayerNorm(2560).to(device)
 
 with torch.no_grad():
     fused_test = cross_attn(eo_q_train, met_emb_train)
-    y_hat_test = mlp_head(fused_test)
+    y_hat_test_chk = mlp_head(fused_test)
 
-assert y_hat_test.shape == y_true.shape, \
-    f"Shape mismatch: y_hat={y_hat_test.shape} vs y_true={y_true.shape}"
-assert y_hat_test.dtype == y_true.dtype, \
-    f"Dtype mismatch: y_hat={y_hat_test.dtype} vs y_true={y_true.dtype}"
-assert y_hat_test.device == y_true.device, \
-    f"Device mismatch: y_hat={y_hat_test.device} vs y_true={y_true.device}"
+assert y_hat_test_chk.shape == y_train.shape, \
+    f"Shape mismatch: y_hat={y_hat_test_chk.shape} vs y_true={y_train.shape}"
 
-print(f"  y_hat shape  : {y_hat_test.shape}  ✅")
-print(f"  y_true shape : {y_true.shape}  ✅")
-print(f"  dtype        : {y_true.dtype}  ✅")
-print(f"  device       : {y_true.device}  ✅")
+print(f"  shapes OK ✅  device={y_train.device}  dtype={y_train.dtype}")
+
 
 # ════════════════════════════════════════════════════════
 #  OPTIMIZER & SCHEDULER
@@ -210,6 +251,7 @@ print(f"\nStarting training — {N_EPOCHS} epochs...\n")
 
 best_loss    = float("inf")
 loss_history = []
+val_loss_history = []
 
 for epoch in range(N_EPOCHS):
     cross_attn.train()
@@ -223,7 +265,7 @@ for epoch in range(N_EPOCHS):
     fused = cross_attn(eo_q_train, met_emb_train)  # [1, N_valid, 1024]
     y_hat = mlp_head(fused)                         # [1, N_valid]
 
-    loss       = loss_fn(y_hat, y_true)
+    loss       = loss_fn(y_hat, y_train)
     l2_reg     = sum(p.pow(2).sum() for p in cross_attn.parameters()) * L2_LAMBDA
     total_loss = loss + l2_reg
 
@@ -235,6 +277,16 @@ for epoch in range(N_EPOCHS):
     scheduler.step()
 
     loss_history.append(loss.item())
+
+
+    with torch.no_grad():
+        cross_attn.eval(); mlp_head.eval()
+        fused_val  = cross_attn(eo_q_test, met_emb_test)
+        y_hat_val  = mlp_head(fused_val)
+        val_loss   = loss_fn(y_hat_val, y_test).item()
+        val_loss_history.append(val_loss)
+
+
 
     # Save checkpoint every epoch so a crash never loses more than 1 epoch
     torch.save({
@@ -249,11 +301,13 @@ for epoch in range(N_EPOCHS):
         "scheduler":  scheduler.state_dict(),
         "y_mean":     y_mean,
         "y_std":      y_std,
+        "train_geoids": train_geoids,   # ★ 分割情報も保存
+        "test_geoids":  test_geoids,
     }, OUTPUT_DIR / "latest_checkpoint.pt")
 
     # Save best model separately
-    if loss.item() < best_loss:
-        best_loss = loss.item()
+    if val_loss < best_loss:
+        best_loss = val_loss
         torch.save({
             "cross_attn": cross_attn.state_dict(),
             "mlp_head":   mlp_head.state_dict(),
@@ -262,11 +316,14 @@ for epoch in range(N_EPOCHS):
             "norm_clim":  norm_clim.state_dict(),
             "y_mean":     y_mean,
             "y_std":      y_std,
+            "train_geoids": train_geoids,
+            "test_geoids":  test_geoids,
         }, OUTPUT_DIR / "best_model.pt")
 
     if epoch % 10 == 0:
         print(f"Epoch {epoch:3d}/{N_EPOCHS} | "
-              f"Loss: {loss.item():.6f} | "
+              f"Train Loss: {loss.item():.6f} | "
+              f"Val Loss: {val_loss:.6f} | "
               f"Best: {best_loss:.6f} | "
               f"LR: {scheduler.get_last_lr()[0]:.2e}")
 
@@ -279,11 +336,13 @@ print(f"  Best model : {OUTPUT_DIR / 'best_model.pt'}")
 # ════════════════════════════════════════════════════════
 
 plt.figure(figsize=(8, 4))
-plt.plot(loss_history, color="#1D9E75", linewidth=1.5)
+plt.plot(loss_history,     color="#1D9E75", linewidth=1.5, label="Train loss")
+plt.plot(val_loss_history, color="#E24B4A", linewidth=1.5, label="Test loss")  # ★ 追加
 plt.xlabel("Epoch")
 plt.ylabel("MSE Loss")
-plt.title("Training Loss Curve")
+plt.title("Training / Test Loss Curve")
 plt.yscale("log")
+plt.legend()
 plt.grid(alpha=0.3)
 plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "loss_curve.png", dpi=150)
