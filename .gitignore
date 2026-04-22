@@ -11,4 +11,5 @@ data/raw/*
 .cache/*
 *.zip
 *.tar.gz
-*.tif
+*.tif\
+.claude\
