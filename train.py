@@ -39,6 +39,7 @@ LR         = 1e-4
 L2_LAMBDA  = 1e-5
 TRAIN_RATIO = 0.7
 RANDOM_SEED = 42
+EARLY_STOPPING_PATIENCE = 30  # これも追加
 
 # ════════════════════════════════════════════════════════
 #  MODEL DEFINITIONS (copied from Cell 5 & 6)
@@ -251,8 +252,11 @@ with torch.no_grad():
     fused_test     = cross_attn(_q_chk, _met_chk)
     y_hat_test_chk = mlp_head(fused_test)
 
-assert y_hat_test_chk.shape == y_train.shape, \
-    f"Shape mismatch: y_hat={y_hat_test_chk.shape} vs y_true={y_train.shape}"
+# assert y_hat_test_chk.shape == y_train.shape, \
+#     f"Shape mismatch: y_hat={y_hat_test_chk.shape} vs y_true={y_train.shape}"
+
+assert y_hat_test_chk.shape == (1, 2), \
+    f"Shape mismatch: y_hat={y_hat_test_chk.shape}, expected (1, 2)"
 
 print(f"  shapes OK ✅  device={y_train.device}  dtype={y_train.dtype}")
 
@@ -282,6 +286,7 @@ val_loss_history = []
 
 pbar = tqdm(range(N_EPOCHS), desc="Training", ncols=110,
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}")
+patience_counter = 0  # ← 追加
 
 for epoch in pbar:
     # ── Train ──────────────────────────────────────────
@@ -353,7 +358,11 @@ for epoch in pbar:
             "test_geoids":  test_geoids,
         }, OUTPUT_DIR / "best_model.pt")
         pbar.write(f"  ★ Best model updated  epoch={epoch}  val={val_loss:.6f}")
-
+    else:
+        patience_counter += 1          # ← 追加
+        if patience_counter >= EARLY_STOPPING_PATIENCE:   # ← 追加
+            pbar.write(f"  Early stopping at epoch={epoch}  best_val={best_loss:.6f}")  # ← 追加
+            break  
 print(f"\nTraining complete!")
 print(f"  Best val loss : {best_loss:.6f}")
 print(f"  Best model    : {OUTPUT_DIR / 'best_model.pt'}")

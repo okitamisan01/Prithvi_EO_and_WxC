@@ -70,7 +70,7 @@ EO_CHECKPOINT_PATH = EO_DIR / "Prithvi_EO_V2_300M.pt"
 #  Tuning knobs — GPU-FIRST STRATEGY
 #  Use VRAM instead of system RAM (less bottleneck)
 # ══════════════════════════════════════════════════════
-PATCH_BATCH_SIZE = 1      # MICRO: Process 1 patch at a time (fits in VRAM)
+PATCH_BATCH_SIZE = 10      # MICRO: Process 1 patch at a time (fits in VRAM)
                           # Increase only if you have > 24GB VRAM available
 WXC_USE_AMP      = True   # Step 4a: fp16 autocast (keeps VRAM usage steady)
 AMP_DTYPE        = torch.float16   # fp16 precision to fit model in VRAM
@@ -81,7 +81,7 @@ ENABLE_WXCFP16_WEIGHTS = True # KEEP fp16: WxC model in half precision (~10GB in
 ENABLE_AGGRESSIVECLEANUP = False # Disable: GPU cache is fast, no need to clear constantly
 CLEANUP_EVERY_N_PATCHES = 1   # Cleanup every 10 patches (GPU can handle it)
 PROJECTION_DTYPE = torch.float32  # Keep float32 for small ops (no benefit from fp16)
-MAX_COUNTIES_PER_RUN = 1     # GPU can handle many counties in flight
+MAX_COUNTIES_PER_RUN = 5     # GPU can handle many counties in flight
 
 
 
@@ -118,7 +118,7 @@ _df_gaz = _df_gaz[["GEOID","NAME","USPS","INTPTLAT","INTPTLONG"]].rename(
     columns={"INTPTLAT":"lat","INTPTLONG":"lon","USPS":"state"}
 )
 df_target = _df_usda[["GEOID"]].merge(_df_gaz, on="GEOID", how="inner")
-df_target = df_target.iloc[:10].reset_index(drop=True)   # 必要に応じて上限変更
+df_target = df_target.iloc[:200].reset_index(drop=True)   # 必要に応じて上限変更
 
 RESOLVED_GEOIDS = df_target["GEOID"].tolist()
 print(f"  Target counties : {len(RESOLVED_GEOIDS)}")
@@ -528,7 +528,7 @@ def interpolate_county_features(feature_map_cpu, C_sc_cpu, df_target, device):
 
         wxc_normed  = _norm_wxc(county_weather_token)
         clim_normed = _norm_clim(_proj_clim(local_climatology_vector))
-                   
+
         met_embedding = torch.cat([wxc_normed, clim_normed], dim=-1)  # [1, N, 5120]
 
     print_gpu_memory("Step4b_end")

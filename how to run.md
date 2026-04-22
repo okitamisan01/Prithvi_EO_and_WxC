@@ -1,5 +1,5 @@
 正確な実行順序（今回）
-# ① パッチファイルを圧縮（46GB → 237MB）← 必須・先に
+# ① パッチファイルを圧縮（46GB → 237MB）← 必須・先にmain.ipynb
 python compress_patches.py
 
 # ② met_embedding.pt を削除

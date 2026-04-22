@@ -60,6 +60,8 @@ TRAIN_RATIO = 0.7
 RANDOM_SEED = 42
 TARGET_YEAR = 2020
 
+EARLY_STOPPING_PATIENCE = 30
+
 # ════════════════════════════════════════════════════════
 #  PATHS & IMPORTS
 # ════════════════════════════════════════════════════════
@@ -133,9 +135,12 @@ std_norm   = eo_config["std"]
 img_size   = eo_config["img_size"]
 coords_enc = eo_config["coords_encoding"]
 
+
 eo_cfg = dict(eo_config)
 eo_cfg.update(coords_encoding=coords_enc, num_frames=1, in_chans=len(bands))
 eo_model = PrithviMAE(**eo_cfg).to(device)
+
+print([name for name, _ in eo_model.named_children()])
 
 sd = torch.load(EO_CHECKPOINT_PATH, map_location=device, weights_only=True)
 for k in list(sd.keys()):
@@ -160,18 +165,18 @@ elif UNFREEZE_EO_LAYERS == -1:
 
 else:
     # transformer blocks の最終 N 層だけ unfreeze
-    n_blocks = len(eo_model.blocks)
+    n_blocks = len(eo_model.encoder.blocks)
     unfreeze_from = max(0, n_blocks - UNFREEZE_EO_LAYERS)
-    for i, block in enumerate(eo_model.blocks):
+    for i, block in enumerate(eo_model.encoder.blocks):
         if i >= unfreeze_from:
             for param in block.parameters():
                 param.requires_grad = True
             eo_unfreeze_params += list(block.parameters())
     # norm layer も unfreeze
-    if hasattr(eo_model, "norm"):
-        for param in eo_model.norm.parameters():
+    if hasattr(eo_model.encoder, "norm"):
+        for param in eo_model.encoder.norm.parameters():
             param.requires_grad = True
-        eo_unfreeze_params += list(eo_model.norm.parameters())
+        eo_unfreeze_params += list(eo_model.encoder.norm.parameters())
 
     n_unfreeze = sum(p.numel() for p in eo_unfreeze_params) / 1e6
     print(f"  EO: last {UNFREEZE_EO_LAYERS} blocks unfrozen  ({n_unfreeze:.1f}M params)")
@@ -363,6 +368,8 @@ val_loss_history = []
 pbar = tqdm(range(N_EPOCHS), desc="Training", ncols=110,
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}")
 
+patience_counter = 0
+
 for epoch in pbar:
     # ── Train ───────────────────────────────────────────
     eo_model.train() if UNFREEZE_EO_LAYERS != 0 else eo_model.eval()
@@ -425,6 +432,12 @@ for epoch in pbar:
         torch.save(best_ckpt, OUTPUT_DIR / "best_model_model.pt")
         pbar.write(f"  ★ Best  epoch={epoch}  val={val_loss:.6f}")
 
+    else:
+        patience_counter += 1                              # ← 追加
+        if patience_counter >= EARLY_STOPPING_PATIENCE:   # ← 追加
+            pbar.write(f"  Early stopping  epoch={epoch}  best_val={best_loss:.6f}")  # ← 追加
+            break                                          # ← 追加
+        
 print(f"\nDone.  Best val loss: {best_loss:.6f}")
 print(f"Best model: {OUTPUT_DIR / 'best_model_model.pt'}")
 
