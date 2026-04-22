@@ -370,6 +370,7 @@ def run_wxc_encoder(wxc_model, batch, device,
         wxc_model = wxc_model.half()
         print("  [WxC] Converted model weights to fp16")
     
+    wxc_model = wxc_model.to(device)
     ctx = torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda"))
 
     with torch.no_grad(), ctx:
@@ -476,8 +477,8 @@ def interpolate_county_features(feature_map_cpu, C_sc_cpu, df_target, device):
     all as CPU tensors.
     """
     # Keep everything on CPU for this cheap step
-    feature_map = feature_map_cpu
-    C_sc        = C_sc_cpu
+    feature_map = feature_map_cpu.float()   # ← .float()追加
+    C_sc        = C_sc_cpu.float()          # ← .float()追加
     
     print_gpu_memory("Step4b_start")
 
@@ -501,24 +502,33 @@ def interpolate_county_features(feature_map_cpu, C_sc_cpu, df_target, device):
             C_sc, grid, mode="bilinear", align_corners=True
         ).squeeze(2).permute(0, 2, 1)           # [1, N, 160]
 
-        # Tiny projection layers — use specified dtype for memory savings
-        _proj_clim = nn.Linear(160, 2560, dtype=PROJECTION_DTYPE)
-        _norm_wxc  = nn.LayerNorm(2560, dtype=PROJECTION_DTYPE)
-        _norm_clim = nn.LayerNorm(2560, dtype=PROJECTION_DTYPE)
+        # # Tiny projection layers — use specified dtype for memory savings
+        # _proj_clim = nn.Linear(160, 2560, dtype=PROJECTION_DTYPE)
+        # _norm_wxc  = nn.LayerNorm(2560, dtype=PROJECTION_DTYPE)
+        # _norm_clim = nn.LayerNorm(2560, dtype=PROJECTION_DTYPE)
 
-        # Convert inputs to projection dtype if needed
-        if PROJECTION_DTYPE != torch.float32:
-            county_weather_token = county_weather_token.to(PROJECTION_DTYPE)
-            local_climatology_vector = local_climatology_vector.to(PROJECTION_DTYPE)
+        # # Convert inputs to projection dtype if needed
+        # if PROJECTION_DTYPE != torch.float32:
+        #     county_weather_token = county_weather_token.to(PROJECTION_DTYPE)
+        #     local_climatology_vector = local_climatology_vector.to(PROJECTION_DTYPE)
 
-        wxc_normed  = _norm_wxc(_proj_clim(county_weather_token))
-        clim_normed = _norm_clim(_proj_clim(local_climatology_vector))
+        # wxc_normed  = _norm_wxc(_proj_clim(county_weather_token))
+        # clim_normed = _norm_clim(_proj_clim(local_climatology_vector))
         
-        # Convert back to float32 for concat if needed
-        if PROJECTION_DTYPE != torch.float32:
-            wxc_normed = wxc_normed.to(torch.float32)
-            clim_normed = clim_normed.to(torch.float32)
-            
+        # # Convert back to float32 for concat if needed
+        # if PROJECTION_DTYPE != torch.float32:
+        #     wxc_normed = wxc_normed.to(torch.float32)
+        #     clim_normed = clim_normed.to(torch.float32)
+
+        D_wxc  = feature_map.shape[1]  # 2560
+        D_clim = C_sc.shape[1]         # 160
+        _proj_clim = nn.Linear(D_clim, D_wxc)
+        _norm_wxc  = nn.LayerNorm(D_wxc)
+        _norm_clim = nn.LayerNorm(D_wxc)
+
+        wxc_normed  = _norm_wxc(county_weather_token)
+        clim_normed = _norm_clim(_proj_clim(local_climatology_vector))
+                   
         met_embedding = torch.cat([wxc_normed, clim_normed], dim=-1)  # [1, N, 5120]
 
     print_gpu_memory("Step4b_end")
@@ -716,9 +726,10 @@ else:
     sd = torch.load(weights_path, map_location=device, weights_only=False)
     sd = sd.get("model_state", sd)
     wxc_model.load_state_dict(sd, strict=True)
-    wxc_model = wxc_model.half() 
+    wxc_model = wxc_model.half().to(device) 
     del sd
     gc.collect()
+    torch.cuda.empty_cache()  # ← これを追加するとreservedが減る
     print("  Loaded WxC checkpoint. Running encoder...")
 
     dataset = Merra2Dataset(
