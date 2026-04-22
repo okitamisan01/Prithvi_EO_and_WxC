@@ -24,6 +24,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 import random
+from tqdm import tqdm
 
 # ════════════════════════════════════════════════════════
 #  SETTINGS — edit these to match your environment
@@ -43,6 +44,24 @@ RANDOM_SEED = 42
 #  MODEL DEFINITIONS (copied from Cell 5 & 6)
 #  Must match exactly what the notebook used
 # ════════════════════════════════════════════════════════
+
+class PatchAttentionPooling(nn.Module):
+    """Prithvi-EOブロック直後: 可変長パッチ列 → county embedding Q [B, 1024]"""
+    def __init__(self, embed_dim: int = 1024):
+        super().__init__()
+        self.attention_net = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.LayerNorm(embed_dim // 2),
+            nn.Tanh(),
+            nn.Linear(embed_dim // 2, 1),
+        )
+
+    def forward(self, patch_embeddings: torch.Tensor) -> torch.Tensor:
+        # patch_embeddings: [B, N_patches, 1024]
+        scores  = self.attention_net(patch_embeddings)          # [B, N_patches, 1]
+        weights = F.softmax(scores, dim=1)
+        return torch.bmm(weights.transpose(1, 2), patch_embeddings).squeeze(1)  # [B, 1024]
+
 
 class CrossModalAttention(nn.Module):
     def __init__(self, d_eo: int, d_met: int, n_heads: int, dropout: float = 0.1):
@@ -109,20 +128,26 @@ RESOLVED_GEOIDS = list(q_save_paths.keys())
 print(f"  counties      : {len(RESOLVED_GEOIDS)}")
 
 # ════════════════════════════════════════════════════════
-#  BUILD eo_q  [1, N, 1024]
+#  LOAD PATCH EMBEDDINGS (PatchAttentionPooling の入力)
 # ════════════════════════════════════════════════════════
 
-print("\nBuilding eo_q...")
-eo_q_list = []
-for geoid in RESOLVED_GEOIDS:
-    path = q_save_paths[geoid]
-    assert path.exists(), f"Missing patch file: {path}"
-    q = torch.load(path, map_location=device)   # [1, 1024]
-    eo_q_list.append(q)
+print("\nLoading patch-level Q embeddings per county...")
+county_patches: dict = {}   # geoid → [N_patches, 1024]
+for geoid in tqdm(RESOLVED_GEOIDS, desc="Loading patches"):
+    county_dir  = OUTPUT_DIR / geoid
+    patch_files = sorted(county_dir.glob("extracted_q_patch_*.pt"))
+    assert len(patch_files) > 0, \
+        f"No patch files in {county_dir} — eo_extract_features.py を先に実行してください"
+    patches = []
+    for pf in patch_files:
+        q = torch.load(pf, map_location="cpu")  # [1, 1024] or [1, N_tok, 1024]
+        if q.dim() == 3:
+            q = q[:, 0, :]                       # CLS token → [1, 1024]
+        patches.append(q)
+    county_patches[geoid] = torch.cat(patches, dim=0)  # [N_patches, 1024]
 
-eo_q    = torch.stack(eo_q_list, dim=1)         # [1, N, 1024]
 met_emb = met_embedding[:, :len(RESOLVED_GEOIDS), :]
-print(f"  eo_q    : {eo_q.shape}")
+print(f"  Loaded patches for {len(county_patches)} counties")
 print(f"  met_emb : {met_emb.shape}")
 
 # ════════════════════════════════════════════════════════
@@ -153,12 +178,7 @@ y_true        = torch.tensor(yield_norm, dtype=torch.float32).unsqueeze(0).to(de
 print(f"  y_mean={y_mean:.2f} bu/acre  y_std={y_std:.2f} bu/acre")
 print(f"  (to recover bu/acre: y_pred_buacre = y_hat * y_std + y_mean)")
 
-eo_q_train    = eo_q[:, valid_indices, :].detach()        # [1, N_valid, 1024]
-met_emb_train = met_emb[:, valid_indices, :].detach()     # [1, N_valid, 5120]
-
 print(f"  y_true (normalized) : {y_true.shape}  range {y_true.min():.3f}–{y_true.max():.3f}")
-print(f"  eo_q_train          : {eo_q_train.shape}")
-print(f"  met_emb_train       : {met_emb_train.shape}")
 
 # ════════════════════════════════════════════════════════
 #  SPLIT TRAIN/TEST
@@ -197,12 +217,10 @@ y_test  = torch.tensor(normalize(test_geoids),  dtype=torch.float32).unsqueeze(0
  
 print(f"\n  y_mean={y_mean:.2f} bu/acre  y_std={y_std:.2f} bu/acre  (train統計量)")
  
-eo_q_train    = eo_q[:, train_indices, :].detach()
-met_emb_train = met_emb[:, train_indices, :].detach()
-eo_q_test     = eo_q[:, test_indices,  :].detach()
-met_emb_test  = met_emb[:, test_indices,  :].detach()
- 
-print(f"  eo_q_train : {eo_q_train.shape}  |  eo_q_test : {eo_q_test.shape}")
+met_emb_train = met_emb[:, train_indices, :].detach()   # [1, N_train, 5120]
+met_emb_test  = met_emb[:, test_indices,  :].detach()   # [1, N_test,  5120]
+
+print(f"  met_emb_train : {met_emb_train.shape}  |  met_emb_test : {met_emb_test.shape}")
 
 # ════════════════════════════════════════════════════════
 #  SANITY CHECK — shape / dtype / device
@@ -210,17 +228,27 @@ print(f"  eo_q_train : {eo_q_train.shape}  |  eo_q_test : {eo_q_test.shape}")
 
 print("\nSanity check...")
 
-D_eo  = eo_q_train.shape[-1]       # 1024
-D_met = met_emb_train.shape[-1]    # 5120
+D_met = met_emb.shape[-1]    # 5120
 
-cross_attn = CrossModalAttention(d_eo=D_eo, d_met=D_met, n_heads=8).to(device)
-mlp_head   = MLPRegressionHead(d_in=D_eo).to(device)
-proj_clim  = nn.Linear(160, 2560).to(device)
-norm_wxc   = nn.LayerNorm(2560).to(device)
-norm_clim  = nn.LayerNorm(2560).to(device)
+patch_pool = PatchAttentionPooling(embed_dim=1024).to(device)
+cross_attn = CrossModalAttention(d_eo=1024, d_met=D_met, n_heads=8).to(device)
+mlp_head   = MLPRegressionHead(d_in=1024).to(device)
+
+
+def build_eo_q(geoid_list: list) -> torch.Tensor:
+    """パッチ埋め込み → PatchAttentionPooling → [1, N_counties, 1024]"""
+    qs = []
+    for g in geoid_list:
+        patches = county_patches[g].to(device)      # [N_patches, 1024]
+        q = patch_pool(patches.unsqueeze(0))         # [1, 1024]
+        qs.append(q)
+    return torch.stack(qs, dim=1)                    # [1, N, 1024]
+
 
 with torch.no_grad():
-    fused_test = cross_attn(eo_q_train, met_emb_train)
+    _q_chk         = build_eo_q(train_geoids[:2])
+    _met_chk       = met_emb_train[:, :2, :]
+    fused_test     = cross_attn(_q_chk, _met_chk)
     y_hat_test_chk = mlp_head(fused_test)
 
 assert y_hat_test_chk.shape == y_train.shape, \
@@ -234,14 +262,13 @@ print(f"  shapes OK ✅  device={y_train.device}  dtype={y_train.dtype}")
 # ════════════════════════════════════════════════════════
 
 optimizer = torch.optim.Adam([
+    {"params": patch_pool.parameters(), "lr": LR},
     {"params": cross_attn.parameters(), "lr": LR},
     {"params": mlp_head.parameters(),   "lr": LR},
-    {"params": proj_clim.parameters(),  "lr": LR},
-    {"params": norm_wxc.parameters(),   "lr": LR},
-    {"params": norm_clim.parameters(),  "lr": LR},
 ])
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS)
 loss_fn   = nn.MSELoss()
+scaler    = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())  # mixed precision
 
 # ════════════════════════════════════════════════════════
 #  TRAINING LOOP
@@ -249,87 +276,87 @@ loss_fn   = nn.MSELoss()
 
 print(f"\nStarting training — {N_EPOCHS} epochs...\n")
 
-best_loss    = float("inf")
-loss_history = []
+best_loss        = float("inf")
+loss_history     = []
 val_loss_history = []
 
-for epoch in range(N_EPOCHS):
-    cross_attn.train()
-    mlp_head.train()
-    proj_clim.train()
-    norm_wxc.train()
-    norm_clim.train()
+pbar = tqdm(range(N_EPOCHS), desc="Training", ncols=110,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}")
 
-    optimizer.zero_grad()
+for epoch in pbar:
+    # ── Train ──────────────────────────────────────────
+    patch_pool.train(); cross_attn.train(); mlp_head.train()
+    optimizer.zero_grad(set_to_none=True)   # set_to_none でメモリ節約
 
-    fused = cross_attn(eo_q_train, met_emb_train)  # [1, N_valid, 1024]
-    y_hat = mlp_head(fused)                         # [1, N_valid]
+    with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+        eo_q_tr = build_eo_q(train_geoids)              # [1, N_train, 1024]
+        fused   = cross_attn(eo_q_tr, met_emb_train)    # [1, N_train, 1024]
+        y_hat   = mlp_head(fused)                        # [1, N_train]
+        loss       = loss_fn(y_hat, y_train)
+        l2_reg     = sum(p.pow(2).sum() for p in cross_attn.parameters()) * L2_LAMBDA
+        total_loss = loss + l2_reg
 
-    loss       = loss_fn(y_hat, y_train)
-    l2_reg     = sum(p.pow(2).sum() for p in cross_attn.parameters()) * L2_LAMBDA
-    total_loss = loss + l2_reg
-
-    total_loss.backward()
+    scaler.scale(total_loss).backward()
+    scaler.unscale_(optimizer)
     torch.nn.utils.clip_grad_norm_(
-        list(cross_attn.parameters()) + list(mlp_head.parameters()), max_norm=1.0
+        list(patch_pool.parameters()) +
+        list(cross_attn.parameters()) +
+        list(mlp_head.parameters()), max_norm=1.0
     )
-    optimizer.step()
+    scaler.step(optimizer)
+    scaler.update()
     scheduler.step()
-
     loss_history.append(loss.item())
 
-
+    # ── Validation ─────────────────────────────────────
     with torch.no_grad():
-        cross_attn.eval(); mlp_head.eval()
-        fused_val  = cross_attn(eo_q_test, met_emb_test)
-        y_hat_val  = mlp_head(fused_val)
-        val_loss   = loss_fn(y_hat_val, y_test).item()
+        patch_pool.eval(); cross_attn.eval(); mlp_head.eval()
+        eo_q_te   = build_eo_q(test_geoids)
+        fused_val = cross_attn(eo_q_te, met_emb_test)
+        y_hat_val = mlp_head(fused_val)
+        val_loss  = loss_fn(y_hat_val, y_test).item()
         val_loss_history.append(val_loss)
 
+    # ── tqdm postfix (毎 epoch 更新) ───────────────────
+    pbar.set_postfix(
+        train=f"{loss.item():.5f}",
+        val=f"{val_loss:.5f}",
+        best=f"{best_loss:.5f}",
+        lr=f"{scheduler.get_last_lr()[0]:.1e}",
+    )
 
-
-    # Save checkpoint every epoch so a crash never loses more than 1 epoch
+    # ── Checkpoint (every epoch) ───────────────────────
     torch.save({
-        "epoch":      epoch,
-        "loss":       loss.item(),
-        "cross_attn": cross_attn.state_dict(),
-        "mlp_head":   mlp_head.state_dict(),
-        "proj_clim":  proj_clim.state_dict(),
-        "norm_wxc":   norm_wxc.state_dict(),
-        "norm_clim":  norm_clim.state_dict(),
-        "optimizer":  optimizer.state_dict(),
-        "scheduler":  scheduler.state_dict(),
-        "y_mean":     y_mean,
-        "y_std":      y_std,
-        "train_geoids": train_geoids,   # ★ 分割情報も保存
+        "epoch":        epoch,
+        "loss":         loss.item(),
+        "patch_pool":   patch_pool.state_dict(),
+        "cross_attn":   cross_attn.state_dict(),
+        "mlp_head":     mlp_head.state_dict(),
+        "optimizer":    optimizer.state_dict(),
+        "scheduler":    scheduler.state_dict(),
+        "y_mean":       y_mean,
+        "y_std":        y_std,
+        "train_geoids": train_geoids,
         "test_geoids":  test_geoids,
     }, OUTPUT_DIR / "latest_checkpoint.pt")
 
-    # Save best model separately
+    # ── Best model ─────────────────────────────────────
     if val_loss < best_loss:
         best_loss = val_loss
         torch.save({
-            "cross_attn": cross_attn.state_dict(),
-            "mlp_head":   mlp_head.state_dict(),
-            "proj_clim":  proj_clim.state_dict(),
-            "norm_wxc":   norm_wxc.state_dict(),
-            "norm_clim":  norm_clim.state_dict(),
-            "y_mean":     y_mean,
-            "y_std":      y_std,
+            "patch_pool":   patch_pool.state_dict(),
+            "cross_attn":   cross_attn.state_dict(),
+            "mlp_head":     mlp_head.state_dict(),
+            "y_mean":       y_mean,
+            "y_std":        y_std,
             "train_geoids": train_geoids,
             "test_geoids":  test_geoids,
         }, OUTPUT_DIR / "best_model.pt")
-
-    if epoch % 10 == 0:
-        print(f"Epoch {epoch:3d}/{N_EPOCHS} | "
-              f"Train Loss: {loss.item():.6f} | "
-              f"Val Loss: {val_loss:.6f} | "
-              f"Best: {best_loss:.6f} | "
-              f"LR: {scheduler.get_last_lr()[0]:.2e}")
+        pbar.write(f"  ★ Best model updated  epoch={epoch}  val={val_loss:.6f}")
 
 print(f"\nTraining complete!")
-print(f"  Best loss  : {best_loss:.6f}")
-print(f"  Best model : {OUTPUT_DIR / 'best_model.pt'}")
+print(f"  Best val loss : {best_loss:.6f}")
+print(f"  Best model    : {OUTPUT_DIR / 'best_model.pt'}")
 
 # ════════════════════════════════════════════════════════
 #  LOSS CURVE
