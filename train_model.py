@@ -190,18 +190,15 @@ def load_hls_windows(tif_path: str):
     HLS TIF → sliding window テンソル + 座標
     戻り値: windows [N_patches, C, T, H, W], temporal_coords, location_coords
     """
-    geoid = Path(tif_path).stem.replace("_HLS", "")
-    if geoid in _hls_img_cache:
-        img, coords = _hls_img_cache[geoid]
-    else:
-        with rasterio.open(tif_path) as src:
-            img = src.read()   # [C, H, W]
-            try:    coords = src.lnglat()
-            except: coords = None
-        img = np.moveaxis(img, 0, -1)
-        img = np.where(img == NO_DATA, NO_DATA_FLOAT,
-                       (img - mean_norm) / std_norm).astype("float32")
-        img = np.moveaxis(img, -1, 0)
+    with rasterio.open(tif_path) as src:
+        img = src.read()   # [C, H, W]
+        try:    coords = src.lnglat()
+        except: coords = None
+
+    img = np.moveaxis(img, 0, -1)
+    img = np.where(img == NO_DATA, NO_DATA_FLOAT,
+                   (img - mean_norm) / std_norm).astype("float32")
+    img = np.moveaxis(img, -1, 0)
     img = np.expand_dims(img, axis=(0, 2))  # [1, C, 1, H, W]
 
     # Timestamp から temporal coords 推定
@@ -232,21 +229,19 @@ def load_hls_windows(tif_path: str):
     return windows, tc, lc
 
 
-def run_eo_and_pool(tif_path, patch_pool, patch_pbar=None, _preloaded=None, phase="train"):
+def run_eo_and_pool(tif_path, patch_pool, patch_pbar=None, _preloaded=None):
     if _preloaded is not None:
         windows, tc, lc = _preloaded
     else:
         windows, tc, lc = load_hls_windows(tif_path)
 
     n_patches = windows.shape[0]
-    # Larger batches = fewer kernel launches = faster GPU utilization
-    # Training: limit by activation memory for backprop; val: no_grad allows much larger
-    BATCH_SIZE = 32 if (phase == "train" and UNFREEZE_EO_LAYERS != 0) else 128
+    BATCH_SIZE = 8  # VRAMに応じて調整（4090なら16でも可）
 
     cls_tokens = []
     for i in range(0, n_patches, BATCH_SIZE):
         x = windows[i:i+BATCH_SIZE].to(device)  # [B, C, T, H, W]
-
+        
         if UNFREEZE_EO_LAYERS == 0:
             with torch.no_grad():
                 feats = eo_model.forward_features(x, tc.expand(x.shape[0], -1),
@@ -254,7 +249,7 @@ def run_eo_and_pool(tif_path, patch_pool, patch_pbar=None, _preloaded=None, phas
         else:
             feats = eo_model.forward_features(x, tc.expand(x.shape[0], -1),
                                                lc.expand(x.shape[0], -1) if lc is not None else None)
-
+        
         cls = feats[-1][:, 0, :]  # [B, 1024]
         cls_tokens.append(cls)
         if patch_pbar is not None:
@@ -284,23 +279,6 @@ for geoid in RESOLVED_GEOIDS:
 
 print(f"  Counties with HLS : {len(hls_paths)} / {len(RESOLVED_GEOIDS)}")
 RESOLVED_GEOIDS = list(hls_paths.keys())
-
-# ════════════════════════════════════════════════════════
-#  PRE-LOAD HLS IMAGES INTO CPU RAM (eliminates repeated disk I/O)
-# ════════════════════════════════════════════════════════
-print("\nPre-loading HLS images into CPU cache...")
-_hls_img_cache: dict = {}  # geoid -> (img_chw float32, coords)
-for _g in tqdm(RESOLVED_GEOIDS, desc="Caching HLS"):
-    with rasterio.open(hls_paths[_g]) as _src:
-        _img = _src.read()
-        try:    _coords = _src.lnglat()
-        except: _coords = None
-    _img = np.moveaxis(_img, 0, -1)
-    _img = np.where(_img == NO_DATA, NO_DATA_FLOAT,
-                    (_img - mean_norm) / std_norm).astype("float32")
-    _img = np.moveaxis(_img, -1, 0)
-    _hls_img_cache[_g] = (_img, _coords)
-print(f"  Cached {len(_hls_img_cache)} county images")
 
 # ════════════════════════════════════════════════════════
 #  MET EMBEDDING (frozen)
@@ -364,7 +342,7 @@ if eo_unfreeze_params:
 optimizer = torch.optim.Adam(param_groups)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS)
 loss_fn   = nn.MSELoss()
-scaler    = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
+scaler    = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
 total_trainable = sum(p.numel() for g in param_groups for p in g["params"]) / 1e6
 print(f"\n  Trainable params : {total_trainable:.2f}M")
@@ -381,16 +359,22 @@ def build_eo_q(geoid_list: list, phase: str = "train",
     qs = []
     for i, g in enumerate(geoid_list):
         print(f"  [{phase}] {i+1}/{n}  geoid={g}", flush=True)
-
+        
+        # TIFを1枚ずつ読んで即推論、メモリを解放
         windows, tc, lc = load_hls_windows(hls_paths[g])
         n_patches = windows.shape[0]
         print(f"           patches={n_patches}", flush=True)
 
-        q = run_eo_and_pool(hls_paths[g], patch_pool, _preloaded=(windows, tc, lc), phase=phase)
+        t_start = time.time()
+
+        q = run_eo_and_pool(hls_paths[g], patch_pool, _preloaded=(windows, tc, lc))
         qs.append(q)
+        
+        print("           EO done in {:.1f}s".format(time.time() - t_start), flush=True)
 
+        # CPUメモリを即解放
         del windows, tc, lc
-
+        
         if i % 10 == 0 and torch.cuda.is_available():
             vram = torch.cuda.memory_allocated() / 1e9
             print(f"           VRAM={vram:.2f}GB", flush=True)
@@ -407,7 +391,7 @@ print(f"\nStarting training — {N_EPOCHS} epochs  (UNFREEZE_EO_LAYERS={UNFREEZE
 best_loss        = float("inf")
 loss_history     = []
 val_loss_history = []
-epoch_times      = []
+epoch_times      = []          # seconds per epoch
 patience_counter = 0
 
 pbar = tqdm(range(N_EPOCHS), desc="Epoch", ncols=110,
@@ -416,6 +400,7 @@ pbar = tqdm(range(N_EPOCHS), desc="Epoch", ncols=110,
 for epoch in pbar:
     t0 = time.time()
 
+    # ── epoch header ────────────────────────────────────
     ts = datetime.datetime.now().strftime("%H:%M:%S")
     pbar.write(f"\n{'─'*70}")
     pbar.write(f"  Epoch {epoch+1}/{N_EPOCHS}  |  {ts}  |  "
@@ -427,7 +412,7 @@ for epoch in pbar:
     optimizer.zero_grad(set_to_none=True)
 
     t_eo = time.time()
-    with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
+    with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
         eo_q_tr = build_eo_q(train_geoids, phase="train", outer_pbar=pbar)
         fused   = cross_attn(eo_q_tr, met_train)
         y_hat   = mlp_head(fused)
@@ -455,14 +440,17 @@ for epoch in pbar:
         val_loss_history.append(val_loss)
     t_val_done = time.time() - t_val
 
+    # ── human-readable RMSE (bu/acre) ───────────────────
     rmse_tr = (loss.item() ** 0.5) * y_std
     rmse_va = (val_loss    ** 0.5) * y_std
 
+    # ── timing ──────────────────────────────────────────
     t_epoch = time.time() - t0
     epoch_times.append(t_epoch)
     avg_t   = sum(epoch_times[-10:]) / len(epoch_times[-10:])
     eta_min = avg_t * (N_EPOCHS - epoch - 1) / 60
 
+    # ── detailed per-epoch output ────────────────────────
     pbar.write(f"  Train : loss={loss.item():.6f}  RMSE={rmse_tr:.2f} bu/acre"
                f"  (EO {t_eo_done:.1f}s)")
     pbar.write(f"  Val   : loss={val_loss:.6f}  RMSE={rmse_va:.2f} bu/acre"
