@@ -406,28 +406,80 @@ for epoch in pbar:
     pbar.write(f"  Epoch {epoch+1}/{N_EPOCHS}  |  {ts}  |  "
                f"patience {patience_counter}/{EARLY_STOPPING_PATIENCE}")
 
+    # # ── Train ───────────────────────────────────────────
+    # eo_model.train() if UNFREEZE_EO_LAYERS != 0 else eo_model.eval()
+    # patch_pool.train(); cross_attn.train(); mlp_head.train()
+    # optimizer.zero_grad(set_to_none=True)
+
+    # t_eo = time.time()
+    # with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+    #     eo_q_tr = build_eo_q(train_geoids, phase="train", outer_pbar=pbar)
+    #     fused   = cross_attn(eo_q_tr, met_train)
+    #     y_hat   = mlp_head(fused)
+    #     loss    = loss_fn(y_hat, y_train)
+    #     l2_reg  = sum(p.pow(2).sum() for p in cross_attn.parameters()) * L2_LAMBDA
+    # t_eo_done = time.time() - t_eo
+
+    # scaler.scale(loss + l2_reg).backward()
+    # scaler.unscale_(optimizer)
+    # torch.nn.utils.clip_grad_norm_(
+    #     [p for g in param_groups for p in g["params"]], max_norm=1.0
+    # )
+    # scaler.step(optimizer); scaler.update()
+    # scheduler.step()
+    # loss_history.append(loss.item())
+
+
     # ── Train ───────────────────────────────────────────
     eo_model.train() if UNFREEZE_EO_LAYERS != 0 else eo_model.eval()
     patch_pool.train(); cross_attn.train(); mlp_head.train()
     optimizer.zero_grad(set_to_none=True)
 
-    t_eo = time.time()
-    with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-        eo_q_tr = build_eo_q(train_geoids, phase="train", outer_pbar=pbar)
-        fused   = cross_attn(eo_q_tr, met_train)
-        y_hat   = mlp_head(fused)
-        loss    = loss_fn(y_hat, y_train)
-        l2_reg  = sum(p.pow(2).sum() for p in cross_attn.parameters()) * L2_LAMBDA
-    t_eo_done = time.time() - t_eo
+    N_tr         = len(train_geoids)
+    running_loss = 0.0
+    t_eo         = time.time()
 
-    scaler.scale(loss + l2_reg).backward()
+    for i, g in enumerate(train_geoids):
+        print(f"  [train] {i+1}/{N_tr}  geoid={g}", flush=True)
+
+        windows, tc, lc = load_hls_windows(hls_paths[g])
+        print(f"           patches={windows.shape[0]}", flush=True)
+        t_start = time.time()
+
+        met_i = met_train[:, i:i+1, :]   # [1, 1, 5120]
+        y_i   = y_train[0, i]            # scalar
+
+        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+            q     = run_eo_and_pool(hls_paths[g], patch_pool,
+                                    _preloaded=(windows, tc, lc))  # [1, 1024]
+            q     = q.unsqueeze(1)                   # [1, 1, 1024]
+            fused = cross_attn(q, met_i)             # [1, 1, 1024]
+            y_hat = mlp_head(fused)                  # [1, 1]
+            loss  = (y_hat.squeeze() - y_i) ** 2 / N_tr
+            l2    = sum(p.pow(2).sum() for p in cross_attn.parameters()) \
+                    * L2_LAMBDA / N_tr
+
+        # ★ backward here → graph freed immediately → VRAM stays flat
+        scaler.scale(loss + l2).backward()
+        running_loss += loss.item() * N_tr
+
+        print(f"           EO done in {time.time()-t_start:.1f}s", flush=True)
+        del windows, tc, lc, q, fused, y_hat, loss
+
+        if i % 10 == 0 and torch.cuda.is_available():
+            print(f"           VRAM={torch.cuda.memory_allocated()/1e9:.2f}GB", flush=True)
+
+    # ★ optimizer step once after ALL counties
     scaler.unscale_(optimizer)
     torch.nn.utils.clip_grad_norm_(
-        [p for g in param_groups for p in g["params"]], max_norm=1.0
-    )
+        [p for g in param_groups for p in g["params"]], max_norm=1.0)
     scaler.step(optimizer); scaler.update()
     scheduler.step()
-    loss_history.append(loss.item())
+
+    train_loss = running_loss / N_tr
+    loss_history.append(train_loss)
+    t_eo_done = time.time() - t_eo
+
 
     # ── Validation ──────────────────────────────────────
     t_val = time.time()
@@ -441,7 +493,9 @@ for epoch in pbar:
     t_val_done = time.time() - t_val
 
     # ── human-readable RMSE (bu/acre) ───────────────────
-    rmse_tr = (loss.item() ** 0.5) * y_std
+    # rmse_tr = (loss.item() ** 0.5) * y_std
+    rmse_tr = (train_loss ** 0.5) * y_std
+
     rmse_va = (val_loss    ** 0.5) * y_std
 
     # ── timing ──────────────────────────────────────────
@@ -451,7 +505,8 @@ for epoch in pbar:
     eta_min = avg_t * (N_EPOCHS - epoch - 1) / 60
 
     # ── detailed per-epoch output ────────────────────────
-    pbar.write(f"  Train : loss={loss.item():.6f}  RMSE={rmse_tr:.2f} bu/acre"
+    pbar.write(f"  Train : loss={train_loss:.6f}  RMSE={rmse_tr:.2f} bu/acre"
+    
                f"  (EO {t_eo_done:.1f}s)")
     pbar.write(f"  Val   : loss={val_loss:.6f}  RMSE={rmse_va:.2f} bu/acre"
                f"  (inf {t_val_done:.1f}s)")
@@ -464,7 +519,7 @@ for epoch in pbar:
                    f"(alloc/reserved)  LR={scheduler.get_last_lr()[0]:.2e}")
 
     pbar.set_postfix(
-        tr=f"{loss.item():.5f}",
+        tr=f"{train_loss:.5f}",
         va=f"{val_loss:.5f}",
         best=f"{best_loss:.5f}",
         rmse=f"{rmse_va:.1f}",
@@ -473,7 +528,7 @@ for epoch in pbar:
 
     # ── Checkpoint ──────────────────────────────────────
     ckpt = {
-        "epoch": epoch, "loss": loss.item(),
+        "epoch": epoch, "loss": train_loss,
         "patch_pool": patch_pool.state_dict(),
         "cross_attn": cross_attn.state_dict(),
         "mlp_head":   mlp_head.state_dict(),
