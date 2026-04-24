@@ -19,7 +19,7 @@ Prerequisites:
   DATA_DIR / USDA_Soybean_County_2020.csv
 """
 
-import gc, json, re, datetime, sys, yaml
+import gc, json, re, datetime, sys, yaml, time
 import random
 from pathlib import Path
 
@@ -52,7 +52,7 @@ EO_CHECKPOINT_PATH = EO_DIR / "Prithvi_EO_V2_300M.pt"
 # -1 = EO 全層を学習（VRAM 注意）
 UNFREEZE_EO_LAYERS = 2
 
-N_EPOCHS    = 500
+N_EPOCHS    = 1
 LR_ADAPTER  = 1e-4   # アダプタ・新規層の学習率
 LR_EO       = 1e-5   # EO unfreeze 層の学習率（小さめ）
 L2_LAMBDA   = 1e-5
@@ -60,7 +60,7 @@ TRAIN_RATIO = 0.7
 RANDOM_SEED = 42
 TARGET_YEAR = 2020
 
-EARLY_STOPPING_PATIENCE = 30
+EARLY_STOPPING_PATIENCE = 20
 
 # ════════════════════════════════════════════════════════
 #  PATHS & IMPORTS
@@ -135,12 +135,9 @@ std_norm   = eo_config["std"]
 img_size   = eo_config["img_size"]
 coords_enc = eo_config["coords_encoding"]
 
-
 eo_cfg = dict(eo_config)
 eo_cfg.update(coords_encoding=coords_enc, num_frames=1, in_chans=len(bands))
 eo_model = PrithviMAE(**eo_cfg).to(device)
-
-print([name for name, _ in eo_model.named_children()])
 
 sd = torch.load(EO_CHECKPOINT_PATH, map_location=device, weights_only=True)
 for k in list(sd.keys()):
@@ -193,15 +190,18 @@ def load_hls_windows(tif_path: str):
     HLS TIF → sliding window テンソル + 座標
     戻り値: windows [N_patches, C, T, H, W], temporal_coords, location_coords
     """
-    with rasterio.open(tif_path) as src:
-        img = src.read()   # [C, H, W]
-        try:    coords = src.lnglat()
-        except: coords = None
-
-    img = np.moveaxis(img, 0, -1)
-    img = np.where(img == NO_DATA, NO_DATA_FLOAT,
-                   (img - mean_norm) / std_norm).astype("float32")
-    img = np.moveaxis(img, -1, 0)
+    geoid = Path(tif_path).stem.replace("_HLS", "")
+    if geoid in _hls_img_cache:
+        img, coords = _hls_img_cache[geoid]
+    else:
+        with rasterio.open(tif_path) as src:
+            img = src.read()   # [C, H, W]
+            try:    coords = src.lnglat()
+            except: coords = None
+        img = np.moveaxis(img, 0, -1)
+        img = np.where(img == NO_DATA, NO_DATA_FLOAT,
+                       (img - mean_norm) / std_norm).astype("float32")
+        img = np.moveaxis(img, -1, 0)
     img = np.expand_dims(img, axis=(0, 2))  # [1, C, 1, H, W]
 
     # Timestamp から temporal coords 推定
@@ -232,29 +232,36 @@ def load_hls_windows(tif_path: str):
     return windows, tc, lc
 
 
-def run_eo_and_pool(tif_path: str, patch_pool: nn.Module) -> torch.Tensor:
-    """
-    HLS TIF → EO encoder → PatchAttentionPooling → county Q [1, 1024]
-    EO unfreeze 層には gradient が流れる
-    """
-    windows, tc, lc = load_hls_windows(tif_path)
+def run_eo_and_pool(tif_path, patch_pool, patch_pbar=None, _preloaded=None, phase="train"):
+    if _preloaded is not None:
+        windows, tc, lc = _preloaded
+    else:
+        windows, tc, lc = load_hls_windows(tif_path)
+
+    n_patches = windows.shape[0]
+    # Larger batches = fewer kernel launches = faster GPU utilization
+    # Training: limit by activation memory for backprop; val: no_grad allows much larger
+    BATCH_SIZE = 32 if (phase == "train" and UNFREEZE_EO_LAYERS != 0) else 128
 
     cls_tokens = []
-    for x in torch.tensor_split(windows, windows.shape[0], dim=0):
-        x = x.to(device)
-        # unfreeze 層がある場合は autocast のみ（no_grad なし）
-        # frozen のみの場合は no_grad で VRAM 節約
+    for i in range(0, n_patches, BATCH_SIZE):
+        x = windows[i:i+BATCH_SIZE].to(device)  # [B, C, T, H, W]
+
         if UNFREEZE_EO_LAYERS == 0:
             with torch.no_grad():
-                feats = eo_model.forward_features(x, tc, lc)
+                feats = eo_model.forward_features(x, tc.expand(x.shape[0], -1),
+                                                   lc.expand(x.shape[0], -1) if lc is not None else None)
         else:
-            feats = eo_model.forward_features(x, tc, lc)
+            feats = eo_model.forward_features(x, tc.expand(x.shape[0], -1),
+                                               lc.expand(x.shape[0], -1) if lc is not None else None)
 
-        cls = feats[-1][:, 0, :]   # CLS token [1, 1024]
+        cls = feats[-1][:, 0, :]  # [B, 1024]
         cls_tokens.append(cls)
+        if patch_pbar is not None:
+            patch_pbar.update(x.shape[0])
 
     patches = torch.cat(cls_tokens, dim=0).unsqueeze(0)  # [1, N_patches, 1024]
-    return patch_pool(patches)                            # [1, 1024]
+    return patch_pool(patches)                    # [1, 1024]
 
 
 # ════════════════════════════════════════════════════════
@@ -277,6 +284,23 @@ for geoid in RESOLVED_GEOIDS:
 
 print(f"  Counties with HLS : {len(hls_paths)} / {len(RESOLVED_GEOIDS)}")
 RESOLVED_GEOIDS = list(hls_paths.keys())
+
+# ════════════════════════════════════════════════════════
+#  PRE-LOAD HLS IMAGES INTO CPU RAM (eliminates repeated disk I/O)
+# ════════════════════════════════════════════════════════
+print("\nPre-loading HLS images into CPU cache...")
+_hls_img_cache: dict = {}  # geoid -> (img_chw float32, coords)
+for _g in tqdm(RESOLVED_GEOIDS, desc="Caching HLS"):
+    with rasterio.open(hls_paths[_g]) as _src:
+        _img = _src.read()
+        try:    _coords = _src.lnglat()
+        except: _coords = None
+    _img = np.moveaxis(_img, 0, -1)
+    _img = np.where(_img == NO_DATA, NO_DATA_FLOAT,
+                    (_img - mean_norm) / std_norm).astype("float32")
+    _img = np.moveaxis(_img, -1, 0)
+    _hls_img_cache[_g] = (_img, _coords)
+print(f"  Cached {len(_hls_img_cache)} county images")
 
 # ════════════════════════════════════════════════════════
 #  MET EMBEDDING (frozen)
@@ -340,7 +364,7 @@ if eo_unfreeze_params:
 optimizer = torch.optim.Adam(param_groups)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS)
 loss_fn   = nn.MSELoss()
-scaler    = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+scaler    = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
 
 total_trainable = sum(p.numel() for g in param_groups for p in g["params"]) / 1e6
 print(f"\n  Trainable params : {total_trainable:.2f}M")
@@ -348,13 +372,32 @@ print(f"\n  Trainable params : {total_trainable:.2f}M")
 # ════════════════════════════════════════════════════════
 #  FORWARD HELPER
 # ════════════════════════════════════════════════════════
-def build_eo_q(geoid_list: list) -> torch.Tensor:
-    """全 county の Q embedding を構築 [1, N, 1024]"""
+
+def build_eo_q(geoid_list: list, phase: str = "train",
+               outer_pbar=None) -> torch.Tensor:
+    n = len(geoid_list)
+    print(f"  [{phase}] starting {n} counties...", flush=True)
+
     qs = []
-    for g in geoid_list:
-        q = run_eo_and_pool(hls_paths[g], patch_pool)  # [1, 1024]
+    for i, g in enumerate(geoid_list):
+        print(f"  [{phase}] {i+1}/{n}  geoid={g}", flush=True)
+
+        windows, tc, lc = load_hls_windows(hls_paths[g])
+        n_patches = windows.shape[0]
+        print(f"           patches={n_patches}", flush=True)
+
+        q = run_eo_and_pool(hls_paths[g], patch_pool, _preloaded=(windows, tc, lc), phase=phase)
         qs.append(q)
-    return torch.stack(qs, dim=1)   # [1, N, 1024]
+
+        del windows, tc, lc
+
+        if i % 10 == 0 and torch.cuda.is_available():
+            vram = torch.cuda.memory_allocated() / 1e9
+            print(f"           VRAM={vram:.2f}GB", flush=True)
+
+    print(f"  [{phase}] done — {n} counties", flush=True)
+    return torch.stack(qs, dim=1)  # [1, N, 1024]
+
 
 # ════════════════════════════════════════════════════════
 #  TRAINING LOOP
@@ -364,24 +407,33 @@ print(f"\nStarting training — {N_EPOCHS} epochs  (UNFREEZE_EO_LAYERS={UNFREEZE
 best_loss        = float("inf")
 loss_history     = []
 val_loss_history = []
-
-pbar = tqdm(range(N_EPOCHS), desc="Training", ncols=110,
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}")
-
+epoch_times      = []
 patience_counter = 0
 
+pbar = tqdm(range(N_EPOCHS), desc="Epoch", ncols=110,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}")
+
 for epoch in pbar:
+    t0 = time.time()
+
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    pbar.write(f"\n{'─'*70}")
+    pbar.write(f"  Epoch {epoch+1}/{N_EPOCHS}  |  {ts}  |  "
+               f"patience {patience_counter}/{EARLY_STOPPING_PATIENCE}")
+
     # ── Train ───────────────────────────────────────────
     eo_model.train() if UNFREEZE_EO_LAYERS != 0 else eo_model.eval()
     patch_pool.train(); cross_attn.train(); mlp_head.train()
     optimizer.zero_grad(set_to_none=True)
 
-    with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-        eo_q_tr = build_eo_q(train_geoids)
+    t_eo = time.time()
+    with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
+        eo_q_tr = build_eo_q(train_geoids, phase="train", outer_pbar=pbar)
         fused   = cross_attn(eo_q_tr, met_train)
         y_hat   = mlp_head(fused)
         loss    = loss_fn(y_hat, y_train)
         l2_reg  = sum(p.pow(2).sum() for p in cross_attn.parameters()) * L2_LAMBDA
+    t_eo_done = time.time() - t_eo
 
     scaler.scale(loss + l2_reg).backward()
     scaler.unscale_(optimizer)
@@ -393,19 +445,42 @@ for epoch in pbar:
     loss_history.append(loss.item())
 
     # ── Validation ──────────────────────────────────────
+    t_val = time.time()
     with torch.no_grad():
         eo_model.eval(); patch_pool.eval(); cross_attn.eval(); mlp_head.eval()
-        eo_q_te   = build_eo_q(test_geoids)
+        eo_q_te   = build_eo_q(test_geoids, phase="val", outer_pbar=pbar)
         fused_val = cross_attn(eo_q_te, met_test)
         y_hat_val = mlp_head(fused_val)
         val_loss  = loss_fn(y_hat_val, y_test).item()
         val_loss_history.append(val_loss)
+    t_val_done = time.time() - t_val
+
+    rmse_tr = (loss.item() ** 0.5) * y_std
+    rmse_va = (val_loss    ** 0.5) * y_std
+
+    t_epoch = time.time() - t0
+    epoch_times.append(t_epoch)
+    avg_t   = sum(epoch_times[-10:]) / len(epoch_times[-10:])
+    eta_min = avg_t * (N_EPOCHS - epoch - 1) / 60
+
+    pbar.write(f"  Train : loss={loss.item():.6f}  RMSE={rmse_tr:.2f} bu/acre"
+               f"  (EO {t_eo_done:.1f}s)")
+    pbar.write(f"  Val   : loss={val_loss:.6f}  RMSE={rmse_va:.2f} bu/acre"
+               f"  (inf {t_val_done:.1f}s)")
+    pbar.write(f"  Best  : {best_loss:.6f}  |  epoch {t_epoch:.1f}s"
+               f"  avg={avg_t:.1f}s  ETA≈{eta_min:.0f}min")
+    if torch.cuda.is_available():
+        vram_alloc = torch.cuda.memory_allocated() / 1e9
+        vram_res   = torch.cuda.memory_reserved()  / 1e9
+        pbar.write(f"  VRAM  : {vram_alloc:.2f}/{vram_res:.2f} GB  "
+                   f"(alloc/reserved)  LR={scheduler.get_last_lr()[0]:.2e}")
 
     pbar.set_postfix(
-        train=f"{loss.item():.5f}",
-        val=f"{val_loss:.5f}",
+        tr=f"{loss.item():.5f}",
+        va=f"{val_loss:.5f}",
         best=f"{best_loss:.5f}",
-        lr=f"{scheduler.get_last_lr()[0]:.1e}",
+        rmse=f"{rmse_va:.1f}",
+        t=f"{t_epoch:.0f}s",
     )
 
     # ── Checkpoint ──────────────────────────────────────
@@ -426,18 +501,20 @@ for epoch in pbar:
     torch.save(ckpt, OUTPUT_DIR / "latest_checkpoint_model.pt")
 
     if val_loss < best_loss:
-        best_loss = val_loss
+        best_loss        = val_loss
+        patience_counter = 0
         best_ckpt = {k: v for k, v in ckpt.items()
                      if k not in ("epoch", "optimizer", "scheduler")}
         torch.save(best_ckpt, OUTPUT_DIR / "best_model_model.pt")
-        pbar.write(f"  ★ Best  epoch={epoch}  val={val_loss:.6f}")
-
+        pbar.write(f"  ★ New best!  epoch={epoch+1}  val={val_loss:.6f}"
+                   f"  RMSE={rmse_va:.2f} bu/acre  → saved")
     else:
-        patience_counter += 1                              # ← 追加
-        if patience_counter >= EARLY_STOPPING_PATIENCE:   # ← 追加
-            pbar.write(f"  Early stopping  epoch={epoch}  best_val={best_loss:.6f}")  # ← 追加
-            break                                          # ← 追加
-        
+        patience_counter += 1
+        if patience_counter >= EARLY_STOPPING_PATIENCE:
+            pbar.write(f"\n  Early stopping  epoch={epoch+1}"
+                       f"  best_val={best_loss:.6f}")
+            break
+
 print(f"\nDone.  Best val loss: {best_loss:.6f}")
 print(f"Best model: {OUTPUT_DIR / 'best_model_model.pt'}")
 
