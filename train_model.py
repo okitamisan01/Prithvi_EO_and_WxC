@@ -52,9 +52,9 @@ EO_CHECKPOINT_PATH = EO_DIR / "Prithvi_EO_V2_300M.pt"
 # -1 = EO 全層を学習（VRAM 注意）
 UNFREEZE_EO_LAYERS = 2
 
-N_EPOCHS    = 1
+N_EPOCHS    = 100
 LR_ADAPTER  = 1e-4   # アダプタ・新規層の学習率
-LR_EO       = 1e-5   # EO unfreeze 層の学習率（小さめ）
+LR_EO       = 1e-6   # EO unfreeze 層の学習率（fp32に切り替えたので更に小さく）
 L2_LAMBDA   = 1e-5
 TRAIN_RATIO = 0.7
 RANDOM_SEED = 42
@@ -236,7 +236,7 @@ def run_eo_and_pool(tif_path, patch_pool, patch_pbar=None, _preloaded=None):
         windows, tc, lc = load_hls_windows(tif_path)
 
     n_patches = windows.shape[0]
-    BATCH_SIZE = 8  # VRAMに応じて調整（4090なら16でも可）
+    BATCH_SIZE = 2  # VRAMに応じて調整（4090なら16でも可）
 
     cls_tokens = []
     for i in range(0, n_patches, BATCH_SIZE):
@@ -284,6 +284,10 @@ RESOLVED_GEOIDS = list(hls_paths.keys())
 #  MET EMBEDDING (frozen)
 # ════════════════════════════════════════════════════════
 met_embedding = torch.load(OUTPUT_DIR / "met_embedding.pt", map_location=device)
+nan_count = torch.isnan(met_embedding).sum().item()
+if nan_count > 0:
+    print(f"  [WARN] met_embedding has {nan_count} NaN values — replacing with 0")
+    met_embedding = torch.nan_to_num(met_embedding, nan=0.0, posinf=0.0, neginf=0.0)
 met_emb       = met_embedding[:, :len(RESOLVED_GEOIDS), :]
 print(f"  met_embedding : {met_emb.shape}")
 
@@ -351,35 +355,18 @@ print(f"\n  Trainable params : {total_trainable:.2f}M")
 #  FORWARD HELPER
 # ════════════════════════════════════════════════════════
 
-def build_eo_q(geoid_list: list, phase: str = "train",
+def build_eo_q(geoid_list: list, phase: str = "val",
                outer_pbar=None) -> torch.Tensor:
     n = len(geoid_list)
-    print(f"  [{phase}] starting {n} counties...", flush=True)
-
     qs = []
-    for i, g in enumerate(geoid_list):
-        print(f"  [{phase}] {i+1}/{n}  geoid={g}", flush=True)
-        
-        # TIFを1枚ずつ読んで即推論、メモリを解放
+    bar = tqdm(enumerate(geoid_list), total=n,
+               desc=f"  [{phase}]", leave=False, ncols=100)
+    for i, g in bar:
+        bar.set_postfix(geoid=g, done=f"{i+1}/{n}")
         windows, tc, lc = load_hls_windows(hls_paths[g])
-        n_patches = windows.shape[0]
-        print(f"           patches={n_patches}", flush=True)
-
-        t_start = time.time()
-
         q = run_eo_and_pool(hls_paths[g], patch_pool, _preloaded=(windows, tc, lc))
         qs.append(q)
-        
-        print("           EO done in {:.1f}s".format(time.time() - t_start), flush=True)
-
-        # CPUメモリを即解放
         del windows, tc, lc
-        
-        if i % 10 == 0 and torch.cuda.is_available():
-            vram = torch.cuda.memory_allocated() / 1e9
-            print(f"           VRAM={vram:.2f}GB", flush=True)
-
-    print(f"  [{phase}] done — {n} counties", flush=True)
     return torch.stack(qs, dim=1)  # [1, N, 1024]
 
 
@@ -406,30 +393,6 @@ for epoch in pbar:
     pbar.write(f"  Epoch {epoch+1}/{N_EPOCHS}  |  {ts}  |  "
                f"patience {patience_counter}/{EARLY_STOPPING_PATIENCE}")
 
-    # # ── Train ───────────────────────────────────────────
-    # eo_model.train() if UNFREEZE_EO_LAYERS != 0 else eo_model.eval()
-    # patch_pool.train(); cross_attn.train(); mlp_head.train()
-    # optimizer.zero_grad(set_to_none=True)
-
-    # t_eo = time.time()
-    # with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-    #     eo_q_tr = build_eo_q(train_geoids, phase="train", outer_pbar=pbar)
-    #     fused   = cross_attn(eo_q_tr, met_train)
-    #     y_hat   = mlp_head(fused)
-    #     loss    = loss_fn(y_hat, y_train)
-    #     l2_reg  = sum(p.pow(2).sum() for p in cross_attn.parameters()) * L2_LAMBDA
-    # t_eo_done = time.time() - t_eo
-
-    # scaler.scale(loss + l2_reg).backward()
-    # scaler.unscale_(optimizer)
-    # torch.nn.utils.clip_grad_norm_(
-    #     [p for g in param_groups for p in g["params"]], max_norm=1.0
-    # )
-    # scaler.step(optimizer); scaler.update()
-    # scheduler.step()
-    # loss_history.append(loss.item())
-
-
     # ── Train ───────────────────────────────────────────
     eo_model.train() if UNFREEZE_EO_LAYERS != 0 else eo_model.eval()
     patch_pool.train(); cross_attn.train(); mlp_head.train()
@@ -439,35 +402,40 @@ for epoch in pbar:
     running_loss = 0.0
     t_eo         = time.time()
 
-    for i, g in enumerate(train_geoids):
-        print(f"  [train] {i+1}/{N_tr}  geoid={g}", flush=True)
+    county_bar = tqdm(enumerate(train_geoids), total=N_tr,
+                      desc="  [train]", leave=False, ncols=100)
+
+    for i, g in county_bar:
+        county_bar.set_postfix(geoid=g, done=f"{i+1}/{N_tr}")
 
         windows, tc, lc = load_hls_windows(hls_paths[g])
-        print(f"           patches={windows.shape[0]}", flush=True)
-        t_start = time.time()
-
         met_i = met_train[:, i:i+1, :]   # [1, 1, 5120]
-        y_i   = y_train[0, i]            # scalar
+        y_i   = y_train[0, i].float()    # scalar, fp32
 
+        # ── EO inference in fp32 (avoid fp16 overflow in unfrozen blocks) ──
+        q = run_eo_and_pool(hls_paths[g], patch_pool,
+                            _preloaded=(windows, tc, lc))   # [1, 1024] fp32
+        q = q.unsqueeze(1)                                  # [1, 1, 1024]
+
+        # ── adapter forward in fp16 (safe — small linear layers) ────────────
         with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-            q     = run_eo_and_pool(hls_paths[g], patch_pool,
-                                    _preloaded=(windows, tc, lc))  # [1, 1024]
-            q     = q.unsqueeze(1)                   # [1, 1, 1024]
             fused = cross_attn(q, met_i)             # [1, 1, 1024]
-            y_hat = mlp_head(fused)                  # [1, 1]
-            loss  = (y_hat.squeeze() - y_i) ** 2 / N_tr
+            y_hat = mlp_head(fused).squeeze().float() # scalar, cast back to fp32
+            loss  = (y_hat - y_i) ** 2 / N_tr
             l2    = sum(p.pow(2).sum() for p in cross_attn.parameters()) \
                     * L2_LAMBDA / N_tr
 
-        # ★ backward here → graph freed immediately → VRAM stays flat
+        if i == 0 and torch.isnan(loss):
+            raise RuntimeError(
+                f"NaN loss at epoch {epoch+1} county {g}.\n"
+                f"  met_train has NaN: {torch.isnan(met_train).any()}\n"
+                f"  y_i={y_i.item():.4f}  → likely bad met_embedding.pt"
+            )
+
         scaler.scale(loss + l2).backward()
+
         running_loss += loss.item() * N_tr
-
-        print(f"           EO done in {time.time()-t_start:.1f}s", flush=True)
         del windows, tc, lc, q, fused, y_hat, loss
-
-        if i % 10 == 0 and torch.cuda.is_available():
-            print(f"           VRAM={torch.cuda.memory_allocated()/1e9:.2f}GB", flush=True)
 
     # ★ optimizer step once after ALL counties
     scaler.unscale_(optimizer)

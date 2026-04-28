@@ -72,12 +72,12 @@ EO_CHECKPOINT_PATH = EO_DIR / "Prithvi_EO_V2_300M.pt"
 # ══════════════════════════════════════════════════════
 PATCH_BATCH_SIZE = 10      # MICRO: Process 1 patch at a time (fits in VRAM)
                           # Increase only if you have > 24GB VRAM available
-WXC_USE_AMP      = True   # Step 4a: fp16 autocast (keeps VRAM usage steady)
-AMP_DTYPE        = torch.float16   # fp16 precision to fit model in VRAM
+WXC_USE_AMP      = True   # Step 4a: bf16 autocast (same range as fp32, no overflow risk)
+AMP_DTYPE        = torch.bfloat16  # bf16: exponent range identical to fp32 → no NaN/Inf overflow
 
 # ════ GPU-focused memory strategy (avoid CPU RAM) ════
 ENABLE_PINNED_MEMORY = False  # DISABLE: Don't use CPU pinned memory
-ENABLE_WXCFP16_WEIGHTS = True # KEEP fp16: WxC model in half precision (~10GB instead of 20GB)
+ENABLE_WXCFP16_WEIGHTS = True # WxC model weights in bf16 (set False to use fp16 weights)
 ENABLE_AGGRESSIVECLEANUP = False # Disable: GPU cache is fast, no need to clear constantly
 CLEANUP_EVERY_N_PATCHES = 1   # Cleanup every 10 patches (GPU can handle it)
 PROJECTION_DTYPE = torch.float32  # Keep float32 for small ops (no benefit from fp16)
@@ -267,6 +267,44 @@ print(f"  HLS: {len(hls_results)} OK / {len(failed_hls)} failed")
 # Call it from the county loop exactly as before:
 #   run_eo_inference(geoid, tif_path, eo_model, device, ...)
 
+NO_DATA       = -9999
+NO_DATA_FLOAT = 0.0001
+
+def read_geotiff(path):
+    with rasterio.open(path) as src:
+        img    = src.read()
+        meta   = src.meta
+        try:    coords = src.lnglat()
+        except: coords = None
+    return img, meta, coords
+
+def load_example(file_paths, mean, std):
+    imgs, temporal_coords, location_coords = [], [], []
+    for file in file_paths:
+        img, meta, coords = read_geotiff(file)
+        img = np.moveaxis(img, 0, -1)
+        img = np.where(img == NO_DATA, NO_DATA_FLOAT, (img - mean) / std)
+        imgs.append(img)
+        if coords:
+            location_coords.append(coords)
+        try:
+            match = re.search(r"(\d{7,8}T\d{6})", str(file))
+            if match:
+                year     = int(match.group(1)[:4])
+                jday_str = match.group(1).split("T")[0][4:]
+                jday     = int(jday_str) if len(jday_str) == 3 else \
+                           datetime.datetime.strptime(jday_str, "%m%d").timetuple().tm_yday
+                temporal_coords.append([year, jday])
+            else:
+                temporal_coords.append([TARGET_YEAR_EO, 1])
+        except:
+            temporal_coords.append([TARGET_YEAR_EO, 1])
+    imgs = np.stack(imgs, axis=0)
+    imgs = np.moveaxis(imgs, -1, 0).astype("float32")
+    imgs = np.expand_dims(imgs, axis=0)
+    return imgs, temporal_coords, location_coords
+
+
 def run_eo_inference(geoid, tif_path, eo_model, device,
                      mean, std, img_size, coords_enc,
                      geoid_out, TARGET_YEAR_EO,
@@ -274,11 +312,9 @@ def run_eo_inference(geoid, tif_path, eo_model, device,
     """
     Load one county GeoTIFF, run Prithvi-EO in batched patches,
     save extracted_q_patch_*.pt files, and return the path stem.
-    
+
     Enhanced: lazy patch loading, pinned memory, aggressive cleanup.
     """
-    from preprocess import load_example   # reuse your existing helper
-
     input_data, temporal_coords, location_coords = load_example(
         [tif_path], mean=mean, std=std
     )
@@ -365,10 +401,10 @@ def run_wxc_encoder(wxc_model, batch, device,
     """
     wxc_model.eval()
     
-    # Convert weights to fp16 for VRAM savings
+    # Convert weights to bf16 for VRAM savings (bf16 has fp32 range → no overflow)
     if ENABLE_WXCFP16_WEIGHTS and device.type == "cuda":
-        wxc_model = wxc_model.half()
-        print("  [WxC] Converted model weights to fp16")
+        wxc_model = wxc_model.to(torch.bfloat16)
+        print("  [WxC] Converted model weights to bf16")
     
     wxc_model = wxc_model.to(device)
     ctx = torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda"))
@@ -530,6 +566,7 @@ def interpolate_county_features(feature_map_cpu, C_sc_cpu, df_target, device):
         clim_normed = _norm_clim(_proj_clim(local_climatology_vector))
 
         met_embedding = torch.cat([wxc_normed, clim_normed], dim=-1)  # [1, N, 5120]
+    met_embedding = torch.nan_to_num(met_embedding, nan=0.0, posinf=0.0, neginf=0.0)
 
     print_gpu_memory("Step4b_end")
     return met_embedding, county_weather_token.to(torch.float32) if PROJECTION_DTYPE != torch.float32 else county_weather_token, \
@@ -698,7 +735,7 @@ else:
     static_mu, static_sig = static_input_scalers(CLIM_DIR/"musigma_surface.nc",
                                static_surface_vars)
 
-    with open(WXC_DIR / "data" / "config.yaml") as f:
+    with open(DATA_DIR / "Prithvi-WxC-data" / "config.yaml") as f:
         wxc_cfg = yaml.safe_load(f)
     p = wxc_cfg["params"]
 
@@ -722,11 +759,11 @@ else:
         positional_encoding=positional_encoding,
         checkpoint_encoder=[], checkpoint_decoder=[],
     )
-    weights_path = WXC_DIR / "data" / "weights" / "prithvi.wxc.2300m.v1.pt"
+    weights_path = DATA_DIR / "Prithvi-WxC-data" / "prithvi.wxc.2300m.v1.pt"
     sd = torch.load(weights_path, map_location=device, weights_only=False)
     sd = sd.get("model_state", sd)
     wxc_model.load_state_dict(sd, strict=True)
-    wxc_model = wxc_model.half().to(device) 
+    wxc_model = wxc_model.to(torch.bfloat16).to(device)
     del sd
     gc.collect()
     torch.cuda.empty_cache()  # ← これを追加するとreservedが減る
