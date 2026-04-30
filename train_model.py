@@ -17,6 +17,16 @@ Prerequisites:
   OUTPUT_DIR / met_embedding.pt                (from preprocess.py Step 4)
   OUTPUT_DIR / q_save_paths.json
   DATA_DIR / USDA_Soybean_County_2020.csv
+
+  # test counties のみ（デフォルト・60郡）
+python predict.py
+
+# train + test 全郡（200郡）
+python predict.py --all
+
+# 特定の郡だけ
+python predict.py --geoids 17001 17003 17005
+
 """
 
 import gc, json, re, datetime, sys, yaml, time
@@ -371,17 +381,46 @@ def build_eo_q(geoid_list: list, phase: str = "val",
 
 
 # ════════════════════════════════════════════════════════
+#  RESUME FROM CHECKPOINT (if exists)
+# ════════════════════════════════════════════════════════
+best_loss        = float("inf")
+loss_history     = []
+val_loss_history = []
+epoch_times      = []
+patience_counter = 0
+start_epoch      = 0
+
+CKPT_PATH = OUTPUT_DIR / "latest_checkpoint_model.pt"
+if CKPT_PATH.exists():
+    print(f"\nResuming from checkpoint: {CKPT_PATH}")
+    ckpt_resume = torch.load(CKPT_PATH, map_location=device, weights_only=False)
+
+    start_epoch      = ckpt_resume["epoch"] + 1
+    best_loss        = ckpt_resume.get("best_loss", float("inf"))
+    loss_history     = ckpt_resume.get("loss_history", [])
+    val_loss_history = ckpt_resume.get("val_loss_history", [])
+    patience_counter = ckpt_resume.get("patience_counter", 0)
+
+    patch_pool.load_state_dict(ckpt_resume["patch_pool"])
+    cross_attn.load_state_dict(ckpt_resume["cross_attn"])
+    mlp_head.load_state_dict(ckpt_resume["mlp_head"])
+    optimizer.load_state_dict(ckpt_resume["optimizer"])
+    scheduler.load_state_dict(ckpt_resume["scheduler"])
+    if UNFREEZE_EO_LAYERS != 0 and "eo_model" in ckpt_resume:
+        eo_model.load_state_dict(ckpt_resume["eo_model"])
+
+    del ckpt_resume
+    torch.cuda.empty_cache()
+    print(f"  Resumed from epoch {start_epoch}/{N_EPOCHS}  best_loss={best_loss:.6f}")
+else:
+    print(f"\nNo checkpoint found — starting from scratch.")
+
+# ════════════════════════════════════════════════════════
 #  TRAINING LOOP
 # ════════════════════════════════════════════════════════
 print(f"\nStarting training — {N_EPOCHS} epochs  (UNFREEZE_EO_LAYERS={UNFREEZE_EO_LAYERS})\n")
 
-best_loss        = float("inf")
-loss_history     = []
-val_loss_history = []
-epoch_times      = []          # seconds per epoch
-patience_counter = 0
-
-pbar = tqdm(range(N_EPOCHS), desc="Epoch", ncols=110,
+pbar = tqdm(range(start_epoch, N_EPOCHS), desc="Epoch", ncols=110,
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}")
 
 for epoch in pbar:
@@ -474,7 +513,6 @@ for epoch in pbar:
 
     # ── detailed per-epoch output ────────────────────────
     pbar.write(f"  Train : loss={train_loss:.6f}  RMSE={rmse_tr:.2f} bu/acre"
-    
                f"  (EO {t_eo_done:.1f}s)")
     pbar.write(f"  Val   : loss={val_loss:.6f}  RMSE={rmse_va:.2f} bu/acre"
                f"  (inf {t_val_done:.1f}s)")
@@ -497,6 +535,10 @@ for epoch in pbar:
     # ── Checkpoint ──────────────────────────────────────
     ckpt = {
         "epoch": epoch, "loss": train_loss,
+        "best_loss": best_loss,
+        "loss_history": loss_history,
+        "val_loss_history": val_loss_history,
+        "patience_counter": patience_counter,
         "patch_pool": patch_pool.state_dict(),
         "cross_attn": cross_attn.state_dict(),
         "mlp_head":   mlp_head.state_dict(),
@@ -509,11 +551,12 @@ for epoch in pbar:
     if UNFREEZE_EO_LAYERS != 0:
         ckpt["eo_model"] = eo_model.state_dict()
 
-    torch.save(ckpt, OUTPUT_DIR / "latest_checkpoint_model.pt")
-
+    # ── Best / patience update (BEFORE saving checkpoint so counter is correct on resume) ──
     if val_loss < best_loss:
         best_loss        = val_loss
         patience_counter = 0
+        ckpt["best_loss"]        = best_loss
+        ckpt["patience_counter"] = patience_counter
         best_ckpt = {k: v for k, v in ckpt.items()
                      if k not in ("epoch", "optimizer", "scheduler")}
         torch.save(best_ckpt, OUTPUT_DIR / "best_model_model.pt")
@@ -521,10 +564,15 @@ for epoch in pbar:
                    f"  RMSE={rmse_va:.2f} bu/acre  → saved")
     else:
         patience_counter += 1
+        ckpt["patience_counter"] = patience_counter
         if patience_counter >= EARLY_STOPPING_PATIENCE:
             pbar.write(f"\n  Early stopping  epoch={epoch+1}"
                        f"  best_val={best_loss:.6f}")
+            torch.save(ckpt, OUTPUT_DIR / "latest_checkpoint_model.pt")
             break
+
+    # ★ Save latest checkpoint every epoch (enables resume)
+    torch.save(ckpt, OUTPUT_DIR / "latest_checkpoint_model.pt")
 
 print(f"\nDone.  Best val loss: {best_loss:.6f}")
 print(f"Best model: {OUTPUT_DIR / 'best_model_model.pt'}")
