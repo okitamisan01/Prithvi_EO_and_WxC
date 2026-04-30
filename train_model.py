@@ -18,14 +18,7 @@ Prerequisites:
   OUTPUT_DIR / q_save_paths.json
   DATA_DIR / USDA_Soybean_County_2020.csv
 
-  # test counties のみ（デフォルト・60郡）
-python predict.py
 
-# train + test 全郡（200郡）
-python predict.py --all
-
-# 特定の郡だけ
-python predict.py --geoids 17001 17003 17005
 
 """
 
