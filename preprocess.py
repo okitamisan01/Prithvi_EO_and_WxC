@@ -118,7 +118,7 @@ _df_gaz = _df_gaz[["GEOID","NAME","USPS","INTPTLAT","INTPTLONG"]].rename(
     columns={"INTPTLAT":"lat","INTPTLONG":"lon","USPS":"state"}
 )
 df_target = _df_usda[["GEOID"]].merge(_df_gaz, on="GEOID", how="inner")
-df_target = df_target.iloc[:200].reset_index(drop=True)   # 必要に応じて上限変更
+df_target = df_target.iloc[:30].reset_index(drop=True)   # 必要に応じて上限変更
 
 RESOLVED_GEOIDS = df_target["GEOID"].tolist()
 print(f"  Target counties : {len(RESOLVED_GEOIDS)}")

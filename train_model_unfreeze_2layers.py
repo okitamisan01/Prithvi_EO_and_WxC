@@ -60,8 +60,15 @@ EO_CONFIG_PATH     = EO_DIR / "config.json"
 EO_CHECKPOINT_PATH = EO_DIR / "Prithvi_EO_V2_300M.pt"
 
 # ── unfreeze 設定 ─────────────────────────────────────────
-UNFREEZE_EO_LAYERS  = 2   # EO 最終 N transformer block
-UNFREEZE_WXC_LAYERS = 2   # WxC 最終 N encoder block
+#  EO:   0  = 完全 frozen
+#        N  = 最終 N transformer block を unfreeze
+#       -1  = 全 block unfreeze (~25GB, RTX4090 ギリギリ)
+UNFREEZE_EO_LAYERS  = 2
+
+#  WxC:  N  = 最終 N encoder block を unfreeze (prefix cache あり)
+#       -1  = 全 encoder block unfreeze (prefix = embedding出力のみキャッシュ)
+#             ⚠️ VRAM ~60GB → A100 80GB 必要
+UNFREEZE_WXC_LAYERS = 2
 
 N_EPOCHS    = 100
 LR_ADAPTER  = 1e-4   # PatchPool / CrossAttn / MLP
@@ -73,6 +80,12 @@ TRAIN_RATIO = 0.7
 RANDOM_SEED = 42
 TARGET_YEAR = 2020
 EARLY_STOPPING_PATIENCE = 20
+
+# ── county 数の上限 ───────────────────────────────────────
+# None = 全 county 使用（デフォルト）
+# 整数 = preprocess.py の iloc[:N] と同じ先頭 N county だけ使用
+# ※ preprocess.py の df_target.iloc[:200] に合わせるなら 200
+MAX_COUNTIES = None
 
 MONTH       = 1
 INPUT_STEP  = 6
@@ -187,19 +200,31 @@ for param in eo_model.parameters():
 
 eo_unfreeze_params = []
 n_eo_blocks = len(eo_model.encoder.blocks)
-unfreeze_from_eo = max(0, n_eo_blocks - UNFREEZE_EO_LAYERS)
-for i, block in enumerate(eo_model.encoder.blocks):
-    if i >= unfreeze_from_eo:
-        for p in block.parameters():
-            p.requires_grad = True
-        eo_unfreeze_params += list(block.parameters())
-if hasattr(eo_model.encoder, "norm"):
-    for p in eo_model.encoder.norm.parameters():
-        p.requires_grad = True
-    eo_unfreeze_params += list(eo_model.encoder.norm.parameters())
 
-n_eo_unfreeze = sum(p.numel() for p in eo_unfreeze_params) / 1e6
-print(f"  EO: last {UNFREEZE_EO_LAYERS} blocks unfrozen  ({n_eo_unfreeze:.1f}M params)")
+if UNFREEZE_EO_LAYERS == 0:
+    print("  EO: fully frozen")
+
+elif UNFREEZE_EO_LAYERS == -1:
+    for param in eo_model.parameters():
+        param.requires_grad = True
+    eo_unfreeze_params = list(eo_model.parameters())
+    n_eo_unfreeze = sum(p.numel() for p in eo_unfreeze_params) / 1e6
+    print(f"  EO: ALL layers unfrozen  ({n_eo_unfreeze:.0f}M params) ⚠️ VRAM heavy")
+
+else:
+    unfreeze_from_eo = max(0, n_eo_blocks - UNFREEZE_EO_LAYERS)
+    for i, block in enumerate(eo_model.encoder.blocks):
+        if i >= unfreeze_from_eo:
+            for p in block.parameters():
+                p.requires_grad = True
+            eo_unfreeze_params += list(block.parameters())
+    if hasattr(eo_model.encoder, "norm"):
+        for p in eo_model.encoder.norm.parameters():
+            p.requires_grad = True
+        eo_unfreeze_params += list(eo_model.encoder.norm.parameters())
+    n_eo_unfreeze = sum(p.numel() for p in eo_unfreeze_params) / 1e6
+    print(f"  EO: last {UNFREEZE_EO_LAYERS} blocks unfrozen  ({n_eo_unfreeze:.1f}M params)"
+          f"  blocks {unfreeze_from_eo}~{n_eo_blocks-1}")
 
 # ════════════════════════════════════════════════════════
 #  LOAD PRITHVI-WxC MODEL
@@ -275,16 +300,29 @@ def _get_blocks(encoder):
     # fallback: iterate children
     return list(encoder.children())
 
-wxc_blocks    = _get_blocks(wxc_model.encoder)
-n_wxc_blocks  = len(wxc_blocks)
-unfreeze_from_wxc = max(0, n_wxc_blocks - UNFREEZE_WXC_LAYERS)
+wxc_blocks   = _get_blocks(wxc_model.encoder)
+n_wxc_blocks = len(wxc_blocks)
 
 wxc_unfreeze_params = []
-for i, block in enumerate(wxc_blocks):
-    if i >= unfreeze_from_wxc:
+if UNFREEZE_WXC_LAYERS == -1:
+    # 全 encoder block を unfreeze（embedding層はfrozen → prefix cache 可能）
+    unfreeze_from_wxc = 0
+    for block in wxc_blocks:
         for p in block.parameters():
             p.requires_grad = True
         wxc_unfreeze_params += list(block.parameters())
+    n_wxc_unfreeze = sum(p.numel() for p in wxc_unfreeze_params) / 1e6
+    print(f"  WxC: ALL encoder blocks unfrozen  ({n_wxc_unfreeze:.0f}M params) ⚠️ VRAM ~60GB")
+else:
+    unfreeze_from_wxc = max(0, n_wxc_blocks - UNFREEZE_WXC_LAYERS)
+    for i, block in enumerate(wxc_blocks):
+        if i >= unfreeze_from_wxc:
+            for p in block.parameters():
+                p.requires_grad = True
+            wxc_unfreeze_params += list(block.parameters())
+    n_wxc_unfreeze = sum(p.numel() for p in wxc_unfreeze_params) / 1e6
+    print(f"  WxC: last {UNFREEZE_WXC_LAYERS} blocks unfrozen  ({n_wxc_unfreeze:.1f}M params)"
+          f"  blocks {unfreeze_from_wxc}~{n_wxc_blocks-1}")
 
 n_wxc_unfreeze = sum(p.numel() for p in wxc_unfreeze_params) / 1e6
 print(f"  WxC: last {UNFREEZE_WXC_LAYERS} blocks unfrozen  ({n_wxc_unfreeze:.1f}M params)")
@@ -513,7 +551,11 @@ df_yield["GEOID"] = (df_yield["state_ansi"].astype(str).str.zfill(2) +
 yield_map = dict(zip(df_yield["GEOID"], df_yield["YIELD, MEASURED IN BU / ACRE"]))
 
 valid_geoids = [g for g in RESOLVED_GEOIDS if g in yield_map]
-print(f"  Counties with yield : {len(valid_geoids)} / {len(RESOLVED_GEOIDS)}")
+if MAX_COUNTIES is not None:
+    valid_geoids = valid_geoids[:MAX_COUNTIES]
+    print(f"  Counties with yield : {len(valid_geoids)} (capped at MAX_COUNTIES={MAX_COUNTIES})")
+else:
+    print(f"  Counties with yield : {len(valid_geoids)} / {len(RESOLVED_GEOIDS)}")
 
 random.seed(RANDOM_SEED)
 shuffled = valid_geoids.copy(); random.shuffle(shuffled)

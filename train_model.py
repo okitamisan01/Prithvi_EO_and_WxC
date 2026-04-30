@@ -36,6 +36,12 @@ import matplotlib.pyplot as plt
 from einops import rearrange
 from tqdm import tqdm
 
+import sys
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+
 # ════════════════════════════════════════════════════════
 #  SETTINGS
 # ════════════════════════════════════════════════════════
@@ -64,6 +70,12 @@ RANDOM_SEED = 42
 TARGET_YEAR = 2020
 
 EARLY_STOPPING_PATIENCE = 20
+
+# ── county 数の上限 ───────────────────────────────────────
+# None = 全 county 使用（デフォルト）
+# 整数 = preprocess.py の iloc[:N] と同じ先頭 N county だけ使用
+# ※ preprocess.py の df_target.iloc[:200] に合わせるなら 200
+MAX_COUNTIES = 30# None
 
 # ════════════════════════════════════════════════════════
 #  PATHS & IMPORTS
@@ -180,7 +192,7 @@ else:
 
     n_unfreeze = sum(p.numel() for p in eo_unfreeze_params) / 1e6
     print(f"  EO: last {UNFREEZE_EO_LAYERS} blocks unfrozen  ({n_unfreeze:.1f}M params)")
-    print(f"  EO: blocks {unfreeze_from}〜{n_blocks-1} (total {n_blocks} blocks)")
+    print(f"  EO: blocks {unfreeze_from}~{n_blocks-1} (total {n_blocks} blocks)")
 
 # ════════════════════════════════════════════════════════
 #  HLS DATA LOADING (EO 推論用)
@@ -239,7 +251,7 @@ def run_eo_and_pool(tif_path, patch_pool, patch_pbar=None, _preloaded=None):
         windows, tc, lc = load_hls_windows(tif_path)
 
     n_patches = windows.shape[0]
-    BATCH_SIZE = 2  # VRAMに応じて調整（4090なら16でも可）
+    BATCH_SIZE = 4  # VRAMに応じて調整（4090なら16でも可）
 
     cls_tokens = []
     for i in range(0, n_patches, BATCH_SIZE):
@@ -303,7 +315,11 @@ df_yield["GEOID"] = (df_yield["state_ansi"].astype(str).str.zfill(2) +
 yield_map = dict(zip(df_yield["GEOID"], df_yield["YIELD, MEASURED IN BU / ACRE"]))
 
 valid_geoids = [g for g in RESOLVED_GEOIDS if g in yield_map]
-print(f"  Counties with yield : {len(valid_geoids)} / {len(RESOLVED_GEOIDS)}")
+if MAX_COUNTIES is not None:
+    valid_geoids = valid_geoids[:MAX_COUNTIES]   # preprocess.py の iloc[:N] と同じ順序
+    print(f"  Counties with yield : {len(valid_geoids)} (capped at MAX_COUNTIES={MAX_COUNTIES})")
+else:
+    print(f"  Counties with yield : {len(valid_geoids)} / {len(RESOLVED_GEOIDS)}")
 
 random.seed(RANDOM_SEED)
 shuffled     = valid_geoids.copy(); random.shuffle(shuffled)
@@ -581,3 +597,6 @@ plt.title(f"Loss Curve (UNFREEZE_EO_LAYERS={UNFREEZE_EO_LAYERS})")
 plt.yscale("log"); plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "loss_curve_model.png", dpi=150)
 print(f"Loss curve: {OUTPUT_DIR / 'loss_curve_model.png'}")
+
+import os
+os.system("shutdown /s /t 60")

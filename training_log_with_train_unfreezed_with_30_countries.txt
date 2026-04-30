@@ -1,0 +1,32 @@
+Device : cuda
+GPU    : NVIDIA GeForce RTX 4090
+VRAM   : 25.8 GB
+
+Loading Prithvi-EO model...
+  EO: last 2 blocks unfrozen  (25.2M params)  blocks 22~23
+
+Loading Prithvi-WxC model...
+Traceback (most recent call last):
+  File "C:\Users\room208\mizuho\train_model_unfreeze_2layers.py", line 284, in <module>
+  File "C:\Users\room208\mizuho\.venv\Lib\site-packages\torch\serialization.py", line 1549, in load
+  File "C:\Users\room208\mizuho\.venv\Lib\site-packages\torch\serialization.py", line 2143, in _load
+    result = unpickler.load()
+  File "C:\Users\room208\mizuho\.venv\Lib\site-packages\torch\serialization.py", line 2107, in persistent_load
+    typed_storage = load_tensor(
+  File "C:\Users\room208\mizuho\.venv\Lib\site-packages\torch\serialization.py", line 2061, in load_tensor
+    ._typed_storage()
+  File "C:\Users\room208\mizuho\.venv\Lib\site-packages\torch\_tensor.py", line 318, in _typed_storage
+    return torch.TypedStorage(
+  File "C:\Users\room208\mizuho\.venv\Lib\site-packages\torch\storage.py", line 708, in __new__
+    return super().__new__(cls)
+KeyboardInterrupt
+Exception ignored on threading shutdown:
+Traceback (most recent call last):
+  File "C:\Users\room208\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1518, in _shutdown
+KeyboardInterrupt: 
+forrtl: error (200): program aborting due to window-CLOSE event
+Image              PC                Routine            Line        Source             
+KERNELBASE.dll     00007FFF4D70C203  Unknown               Unknown  Unknown
+KERNEL32.DLL       00007FFF4EA77374  Unknown               Unknown  Unknown
+ntdll.dll          00007FFF4FC1CC91  Unknown               Unknown  Unknown
+^C
