@@ -10,6 +10,54 @@ Key changes:
 
 Tested with: torch>=2.1, CUDA 11.8/12.1, 32 GB system RAM + 24 GB VRAM (RTX 3090)
 Even on a CPU-only machine the AMP guard makes the code safe (autocast is a no-op on CPU).
+
+5ステップやっています：
+
+---
+
+**Step 0 — County リスト作成**
+```
+USDA 大豆収量CSV × Gazetteer(lat/lon) を join
+→ 大豆産地 county を先頭30件取得
+```
+
+**Step 1 — データダウンロード**
+```
+・Climatology     ← HuggingFace (WxC用の気候平均値)
+・MERRA-2         ← HuggingFace (2020年1月の気象データ)
+```
+
+**Step 2 — HLS 衛星画像ダウンロード**
+```
+各 county の lat/lon → NASA Earthdata に検索
+→ Sentinel-2 の 6バンド TIF を county ごとに保存
+   data/hls_counties/{geoid}_HLS.tif
+```
+
+**Step 3 — Prithvi-EO 推論（frozen）**
+```
+HLS TIF → 224×224 パッチに分割
+→ EO モデルに通す → CLS token [1, 1024] を保存
+   data/mizuho_output/{geoid}/extracted_q_patch_*.pt
+```
+
+**Step 4 — Prithvi-WxC 推論（frozen）**
+```
+MERRA-2 → WxC モデルに通す → 全球特徴マップ [1, 2560, 180, 288]
+→ 各 county の lat/lon で bilinear interpolation
+→ met_embedding.pt [1, N_counties, 5120] として保存
+```
+
+**Step 5 — インデックス保存**
+```
+q_save_paths.json（county の順序情報）
+```
+
+---
+
+`train_model.py` が使うのは **Step 3の結果（HLS tif）** と **Step 4の結果（met_embedding.pt）** だけです。Step 1・2は一度やれば再実行不要。
+
+
 """
 
 

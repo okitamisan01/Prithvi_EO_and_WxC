@@ -101,7 +101,7 @@ y_std           = ckpt["y_std"]
 train_geoids_ck = ckpt["train_geoids"]
 test_geoids_ck  = ckpt["test_geoids"]
 unfreeze_layers = ckpt.get("unfreeze_eo_layers", 0)
-best_val_loss   = ckpt.get("loss", float("nan"))
+best_val_loss   = ckpt.get("best_loss", ckpt.get("loss", float("nan")))
 
 print(f"  y_mean={y_mean:.2f}  y_std={y_std:.2f} bu/acre")
 print(f"  Train counties : {len(train_geoids_ck)}")
